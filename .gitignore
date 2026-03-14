@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime generated
+gui_last_project.json
+我的小说/
+
+# Exe (too large for git, distribute via Releases)
+*.exe
+
+# OS
+Thumbs.db
+.DS_Store
