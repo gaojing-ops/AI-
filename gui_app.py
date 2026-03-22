@@ -17,15 +17,15 @@ import re
 
 # 模型预设（仅存储默认配置，Key 从 config.json 加载）
 MODEL_PRESETS = {
-    "DeepSeek": {
+    "DeepSeek-V3.2": {
         "config_key_field": "api_key",
         "base_url": "https://api.deepseek.com",
         "model": "deepseek-chat"
     },
-    "MiniMax-M2.5": {
+    "MiniMax-M2.7": {
         "config_key_field": "minimax_api_key",
         "base_url": "https://api.minimaxi.com/v1",
-        "model": "MiniMax-M2.5"
+        "model": "MiniMax-M2.7"
     }
 }
 
@@ -151,7 +151,7 @@ class NovelGeneratorGUI:
         self.root.title(f"千章小说创作系统 v3.0 - {os.path.basename(folder)}")
 
     def get_client(self):
-        preset = MODEL_PRESETS.get(self.model_var.get(), MODEL_PRESETS["DeepSeek"])
+        preset = MODEL_PRESETS.get(self.model_var.get(), list(MODEL_PRESETS.values())[0])
         key_field = preset.get("config_key_field", "api_key")
         api_key = self.config.get(key_field, "")
         if not api_key:
@@ -159,7 +159,7 @@ class NovelGeneratorGUI:
         return OpenAI(api_key=api_key, base_url=preset["base_url"], timeout=120)
     
     def get_model_name(self):
-        preset = MODEL_PRESETS.get(self.model_var.get(), MODEL_PRESETS["DeepSeek"])
+        preset = MODEL_PRESETS.get(self.model_var.get(), list(MODEL_PRESETS.values())[0])
         return preset["model"]
     
     def clean_think_tags(self, text):
@@ -238,7 +238,7 @@ class NovelGeneratorGUI:
         model_frame = ttk.Frame(self.left_scrollable)
         model_frame.pack(fill=tk.X, pady=(5, 10), padx=5)
         ttk.Label(model_frame, text="🤖 AI模型:", font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT)
-        self.model_var = tk.StringVar(value="DeepSeek")
+        self.model_var = tk.StringVar(value=list(MODEL_PRESETS.keys())[0])
         model_combo = ttk.Combobox(model_frame, textvariable=self.model_var, values=list(MODEL_PRESETS.keys()), state="readonly", width=15)
         model_combo.pack(side=tk.RIGHT)
         model_combo.bind("<<ComboboxSelected>>", self.on_model_change)
@@ -936,22 +936,54 @@ class NovelGeneratorGUI:
             # 保存全部标题集合用于生成后硬性去重
             all_titles_set = set(all_titles)
             
-            # 自动完结检测
+            # 自动完结检测（优先从大纲动态检测，回退到硬编码）
             completion_hint = ""
-            TOTAL_TARGET = 1100
-            volume_ends = {250: "第一卷", 500: "第二卷", 750: "第三卷", 950: "第四卷", 1100: "终章"}
             
-            for end_chap, vol_name in volume_ends.items():
-                if end_chap - 10 <= chap_num <= end_chap:
-                    remaining = end_chap - chap_num
-                    if end_chap == TOTAL_TARGET:
-                        completion_hint = f"\n\n【自动完结指令】本书还剩 {remaining} 章即完结（全书共{TOTAL_TARGET}章）。请开始强制收束所有主线伏笔，给出最终结局。本章须推进结局进程。"
-                    else:
-                        completion_hint = f"\n\n【卷末收束指令】{vol_name}还剩 {remaining} 章结束。请开始收束本卷主线冲突，为卷末高潮做铺垫，但不要完结全书。"
-                    break
+            # 动态检测：从当前卷大纲中提取目标完结章节号
+            outline_path = os.path.join(generator.DIRS["plot"], "当前卷大纲.txt")
+            outline_text = generator.read_text_safe(outline_path)
+            dynamic_end_chap = None
             
-            if chap_num >= TOTAL_TARGET:
-                completion_hint = f"\n\n【大结局指令】这是全书的最终章！请收束所有伏笔线索，写出圆满的大结局。结尾需要有余韵。"
+            # 匹配大纲中的章节范围（如 Ch188-210、Ch206-210）或"第215章"、"全书终章"等
+            import re as _re
+            # 查找最大的章节号作为结束章节
+            ch_numbers = _re.findall(r'Ch\d+-(\d+)', outline_text)
+            if ch_numbers:
+                dynamic_end_chap = max(int(n) for n in ch_numbers)
+            if not dynamic_end_chap:
+                ch_numbers = _re.findall(r'第(\d+)章', outline_text)
+                if ch_numbers:
+                    dynamic_end_chap = max(int(n) for n in ch_numbers)
+            
+            # 检查大纲中是否有完结/终章标记
+            has_finale_marker = any(kw in outline_text for kw in ['全书完', '大结局', '全书终章', '完结', '终章'])
+            
+            if dynamic_end_chap and has_finale_marker:
+                # 使用大纲中检测到的完结章节
+                remaining = dynamic_end_chap - chap_num
+                if remaining <= 0:
+                    completion_hint = f'\n\n【🔴 大结局指令】这是全书的最终章！请收束所有伏笔线索，写出圆满的大结局。最后必须写上"全文完"三个字。结尾需要有余韵。'
+                elif remaining <= 3:
+                    completion_hint = f"\n\n【🟡 强制收束指令】本书还剩 {remaining} 章即完结（计划在第{dynamic_end_chap}章结束）。请开始强制收束所有主线伏笔，加速推进结局。本章须大幅推进结局进程，不要再开新坑。"
+                elif remaining <= 8:
+                    completion_hint = f"\n\n【收束提醒】本书计划在第{dynamic_end_chap}章完结，还剩 {remaining} 章。请注意控制节奏，开始收束剧情线，为最终决战和大结局做铺垫。"
+            else:
+                # 回退到硬编码逻辑
+                TOTAL_TARGET = 1100
+                volume_ends = {250: "第一卷", 500: "第二卷", 750: "第三卷", 950: "第四卷", 1100: "终章"}
+                
+                for end_chap, vol_name in volume_ends.items():
+                    if end_chap - 10 <= chap_num <= end_chap:
+                        remaining = end_chap - chap_num
+                        if end_chap == TOTAL_TARGET:
+                            completion_hint = f"\n\n【自动完结指令】本书还剩 {remaining} 章即完结（全书共{TOTAL_TARGET}章）。请开始强制收束所有主线伏笔，给出最终结局。本章须推进结局进程。"
+                        else:
+                            completion_hint = f"\n\n【卷末收束指令】{vol_name}还剩 {remaining} 章结束。请开始收束本卷主线冲突，为卷末高潮做铺垫，但不要完结全书。"
+                        break
+                
+                if chap_num >= TOTAL_TARGET:
+                    completion_hint = f"\n\n【大结局指令】这是全书的最终章！请收束所有伏笔线索，写出圆满的大结局。结尾需要有余韵。"
+
 
             plan_prompt = f"""你现在要写第 {chap_num} 章。
 
@@ -1263,6 +1295,7 @@ class NovelGeneratorGUI:
             finally:
                 self.btn_new.config(state=tk.NORMAL)
                 self.btn_continue.config(state=tk.NORMAL)
+                self.btn_batch.config(state=tk.NORMAL)
         
         threading.Thread(target=do_compress, daemon=True).start()
 
@@ -1305,6 +1338,7 @@ class NovelGeneratorGUI:
             finally:
                 self.btn_new.config(state=tk.NORMAL)
                 self.btn_continue.config(state=tk.NORMAL)
+                self.btn_batch.config(state=tk.NORMAL)
         
         threading.Thread(target=do_track, daemon=True).start()
 
@@ -1354,6 +1388,7 @@ class NovelGeneratorGUI:
             finally:
                 self.btn_new.config(state=tk.NORMAL)
                 self.btn_continue.config(state=tk.NORMAL)
+                self.btn_batch.config(state=tk.NORMAL)
                 
         threading.Thread(target=do_update, daemon=True).start()
 
@@ -1383,6 +1418,7 @@ class NovelGeneratorGUI:
             finally:
                 self.btn_new.config(state=tk.NORMAL)
                 self.btn_continue.config(state=tk.NORMAL)
+                self.btn_batch.config(state=tk.NORMAL)
                 self.btn_save_new.config(state=tk.NORMAL)
         
         threading.Thread(target=do_polish, daemon=True).start()
@@ -1426,6 +1462,7 @@ class NovelGeneratorGUI:
             finally:
                 self.btn_new.config(state=tk.NORMAL)
                 self.btn_continue.config(state=tk.NORMAL)
+                self.btn_batch.config(state=tk.NORMAL)
         
         threading.Thread(target=do_check, daemon=True).start()
 
