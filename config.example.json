@@ -1,0 +1,11 @@
+{
+  "api_key": "YOUR_DEEPSEEK_API_KEY_HERE",
+  "minimax_api_key": "",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-chat",
+  "temperature": 0.85,
+  "max_tokens": 8192,
+  "current_volume": 1,
+  "author_name": "匿名作者",
+  "tone_rules": "请在这里填写你的写作风格要求，例如：轻松幽默、章均2000字、短段落、多对话等。"
+}

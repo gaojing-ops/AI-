@@ -1,0 +1,46 @@
+# 敏感配置
+config.json
+project_config.json
+
+# API Keys（如果存在带真实Key的副本）
+*_with_key*.json
+
+# 生成内容
+output/
+history/
+
+# 项目专属数据（你的小说内容，不要上传到公开仓库）
+characters/*.txt
+world_building/*.txt
+plot/*.txt
+plot/*.md
+plot/*.json
+
+# 封面素材
+cover_*.png
+*.png
+*.jpg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.exe
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 交接文档/笔记
+交接文档.md
+*.tmp
