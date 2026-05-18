@@ -1,0 +1,12 @@
+{
+  "banned_keywords": ["共产党", "国家领导", "政府阴谋", "邪教", "强制爱合理化"],
+  "high_risk_watch_keywords": ["关系强制推进", "身世提前坐实", "未铺垫豪门势力", "商业线硬伤"],
+  "style_risk_keywords": ["油腻形容", "眼眸描写过密", "霸总模板台词"],
+  "memory_required_terms": ["主角", "家族", "商业线", "情感线"],
+  "scanner_forbidden_terms": [],
+  "chapter_gated_terms": [],
+  "event_patterns": [],
+  "event_completion_chapters": {},
+  "old_name_patterns": {},
+  "scanner_allowed_contexts": {}
+}

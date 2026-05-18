@@ -1,0 +1,16 @@
+{
+  "strict_mode": false,
+  "topics": [
+    {
+      "id": "disaster_origin",
+      "name": "灾难源头",
+      "levels": [
+        {"max_chapter": 50, "level": 1, "description": "只允许异常现象"},
+        {"max_chapter": 150, "level": 3, "description": "允许阶段性解释"},
+        {"max_chapter": 9999, "level": 5, "description": "允许完整真相"}
+      ],
+      "hard_keywords": [],
+      "semantic_triggers": ["灾难源头", "幕后真相", "实验起因"]
+    }
+  ]
+}

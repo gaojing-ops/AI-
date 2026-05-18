@@ -1,0 +1,12 @@
+{
+  "banned_keywords": ["共产党", "国家领导", "政府阴谋", "邪教", "开膛破肚", "活剥人皮", "碎尸"],
+  "high_risk_watch_keywords": ["灾难源头提前坐实", "死人复活", "线索回档", "未授权组织空降"],
+  "style_risk_keywords": ["惊悚形容堆叠", "破折号过密", "血腥细节过度"],
+  "memory_required_terms": ["主角", "灾难规则", "线索", "安全区"],
+  "scanner_forbidden_terms": [],
+  "chapter_gated_terms": [],
+  "event_patterns": [],
+  "event_completion_chapters": {},
+  "old_name_patterns": {},
+  "scanner_allowed_contexts": {}
+}

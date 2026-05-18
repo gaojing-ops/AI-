@@ -1,0 +1,12 @@
+{
+  "banned_keywords": ["国家领导", "政府阴谋", "邪教", "现代手机支付", "短视频平台"],
+  "high_risk_watch_keywords": ["年代物资错误", "政策常识错误", "人物关系回档", "现代词汇穿帮"],
+  "style_risk_keywords": ["苦情堆叠", "口号化说教", "章尾短句堆叠"],
+  "memory_required_terms": ["主角", "年代", "家庭", "单位"],
+  "scanner_forbidden_terms": [],
+  "chapter_gated_terms": [],
+  "event_patterns": [],
+  "event_completion_chapters": {},
+  "old_name_patterns": {},
+  "scanner_allowed_contexts": {}
+}

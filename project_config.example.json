@@ -1,0 +1,21 @@
+{
+  "book_title": "我的新小说",
+  "genre_template": "通用空白",
+  "target_total_chapters": 300,
+  "volume_ranges": [
+    [1, 50, "第一卷"],
+    [51, 100, "第二卷"],
+    [101, 150, "第三卷"],
+    [151, 200, "第四卷"],
+    [201, 250, "第五卷"],
+    [251, 300, "第六卷"]
+  ],
+  "chapter_char_min": 3200,
+  "chapter_char_target_min": 3500,
+  "chapter_char_target_max": 5500,
+  "trusteeship_policy": "lenient_continue",
+  "auto_outline_from_volume": false,
+  "health_check_future_chapters": 30,
+  "enabled_skills": [],
+  "tone_rules": ""
+}

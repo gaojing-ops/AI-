@@ -1,0 +1,12 @@
+{
+  "banned_keywords": ["共产党", "国家领导", "政府阴谋", "邪教"],
+  "high_risk_watch_keywords": ["境界回档", "功法规则改写", "天降神器", "未铺垫大能空降"],
+  "style_risk_keywords": ["境界说明堆叠", "玄而又玄空话", "章尾短句堆叠"],
+  "memory_required_terms": ["主角", "境界", "功法", "宗门"],
+  "scanner_forbidden_terms": [],
+  "chapter_gated_terms": [],
+  "event_patterns": [],
+  "event_completion_chapters": {},
+  "old_name_patterns": {},
+  "scanner_allowed_contexts": {}
+}

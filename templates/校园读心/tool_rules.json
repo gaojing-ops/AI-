@@ -1,0 +1,12 @@
+{
+  "banned_keywords": ["共产党", "国家领导", "政府阴谋", "邪教", "肠子流出", "内脏外露", "碎尸"],
+  "high_risk_watch_keywords": ["主动操控读心", "全校广播", "校园暴力过度描写", "核心身世提前坐实"],
+  "style_risk_keywords": ["震惊模板重复", "吐槽过密", "章尾短句堆叠"],
+  "memory_required_terms": ["主角", "读心规则", "学校", "核心秘密"],
+  "scanner_forbidden_terms": [],
+  "chapter_gated_terms": [],
+  "event_patterns": [],
+  "event_completion_chapters": {},
+  "old_name_patterns": {},
+  "scanner_allowed_contexts": {}
+}

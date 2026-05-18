@@ -1,0 +1,4 @@
+{
+  "Router_Scan": {"name": "霸总豪门流派鉴定器", "description": "豪门/商业/情感", "content": "判断片段标签：Romance / Family / Business / General。只输出标签。\n{current_chunk}"},
+  "Extract_General": {"name": "霸总豪门通用提取", "description": "提取关系、家族和商业线", "content": "提取人物关系、家族结构、商业事件、情感阶段、身世线和冲突。\n参考：{context_memory}\n片段：{current_chunk}"}
+}

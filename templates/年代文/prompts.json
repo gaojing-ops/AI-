@@ -1,0 +1,4 @@
+{
+  "Router_Scan": {"name": "年代文流派鉴定器", "description": "年代/家庭/奋斗", "content": "判断片段标签：Period / Family / Workplace / General。只输出标签。\n{current_chunk}"},
+  "Extract_General": {"name": "年代文通用提取", "description": "提取年代背景、家庭和资源", "content": "提取年代、地区、家庭关系、单位、物资、政策边界、时间线和冲突。\n参考：{context_memory}\n片段：{current_chunk}"}
+}

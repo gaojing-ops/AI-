@@ -1,0 +1,4 @@
+{
+  "Router_Scan": {"name": "末世悬疑流派鉴定器", "description": "末世/悬疑/生存", "content": "判断片段标签：Apocalypse / Suspense / Survival / General。只输出标签。\n{current_chunk}"},
+  "Extract_General": {"name": "末世悬疑通用提取", "description": "提取灾难规则和线索", "content": "提取人物状态、灾难规则、安全区、物资、线索、谜题和冲突。\n参考：{context_memory}\n片段：{current_chunk}"}
+}

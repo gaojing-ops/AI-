@@ -1,0 +1,33 @@
+{
+  "banned_keywords": [
+    "共产党",
+    "国家领导",
+    "政府阴谋",
+    "邪教",
+    "肠子流出",
+    "内脏外露",
+    "开膛破肚",
+    "活剥人皮",
+    "碎尸"
+  ],
+  "high_risk_watch_keywords": [
+    "严重时间线回档",
+    "已死亡角色复活",
+    "核心真相提前坐实",
+    "未授权新组织",
+    "未铺垫新Boss",
+    "主角能力规则改写"
+  ],
+  "style_risk_keywords": [
+    "章尾短句堆叠",
+    "章尾破折号过密",
+    "模糊词过密"
+  ],
+  "memory_required_terms": [],
+  "scanner_forbidden_terms": [],
+  "chapter_gated_terms": [],
+  "event_patterns": [],
+  "event_completion_chapters": {},
+  "old_name_patterns": {},
+  "scanner_allowed_contexts": {}
+}

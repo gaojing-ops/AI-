@@ -1,0 +1,4 @@
+{
+  "Router_Scan": {"name": "修仙升级流派鉴定器", "description": "修仙/玄幻/升级", "content": "判断片段标签：Cultivation / Xuanhuan / Sect / General。只输出标签。\n{current_chunk}"},
+  "Extract_General": {"name": "修仙升级通用提取", "description": "提取境界、功法、势力和资源", "content": "提取境界、功法、宗门、法宝、资源、秘境、因果和冲突。\n参考：{context_memory}\n片段：{current_chunk}"}
+}

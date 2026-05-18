@@ -1,0 +1,12 @@
+{
+  "banned_keywords": ["共产党", "国家领导", "政府阴谋", "邪教", "过度血腥细节"],
+  "high_risk_watch_keywords": ["副本规则改写", "死亡规则回档", "积分结算错误", "未铺垫道具空降"],
+  "style_risk_keywords": ["规则说明堆叠", "恐怖形容堆叠", "章尾短句堆叠"],
+  "memory_required_terms": ["主角", "副本", "规则", "奖励"],
+  "scanner_forbidden_terms": [],
+  "chapter_gated_terms": [],
+  "event_patterns": [],
+  "event_completion_chapters": {},
+  "old_name_patterns": {},
+  "scanner_allowed_contexts": {}
+}

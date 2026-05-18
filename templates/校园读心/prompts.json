@@ -1,0 +1,4 @@
+{
+  "Router_Scan": {"name": "校园读心流派鉴定器", "description": "校园/读心/系统", "content": "判断片段标签：Campus / MindVoice / System / General。只输出标签。\n{current_chunk}"},
+  "Extract_General": {"name": "校园读心通用提取", "description": "提取校园、关系和能力边界", "content": "提取人物关系、校园事件、读心规则、系统状态、伏笔和冲突。\n参考：{context_memory}\n片段：{current_chunk}"}
+}

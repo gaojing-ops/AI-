@@ -1,0 +1,43 @@
+# Local/private runtime config
+config.json
+gui_last_project.json
+*_with_key*.json
+
+# Generated writing output
+output/
+publish/
+logs/
+history/
+
+# User manuscript assets beyond starter templates
+characters/*.txt
+world_building/*.txt
+!characters/README.md
+!world_building/README.md
+
+# Optional local assets
+cover_*.png
+*.png
+*.jpg
+
+# Python/cache/build
+__pycache__/
+*.pyc
+*.pyo
+*.exe
+*.egg-info/
+dist/
+build/
+
+# IDE/system/temp
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+
+# Local notes
+交接文档.md

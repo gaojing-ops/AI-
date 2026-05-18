@@ -1,0 +1,4 @@
+{
+  "Router_Scan": {"name": "无限流流派鉴定器", "description": "副本/主神/规则", "content": "判断片段标签：Instance / System / Team / General。只输出标签。\n{current_chunk}"},
+  "Extract_General": {"name": "无限流通用提取", "description": "提取副本、规则、奖励和团队", "content": "提取副本规则、任务、死亡条件、奖励、团队状态、道具和未解谜题。\n参考：{context_memory}\n片段：{current_chunk}"}
+}

@@ -1,0 +1,37 @@
+{
+  "Router_Scan": {
+    "name": "通用流派鉴定器",
+    "description": "阅读小说片段，判断适合的设定提取模板",
+    "content": "你是网络小说流派分类器。请阅读片段，返回最匹配的标签：System / Romance / Suspense / Xuanhuan / Historical / General。只输出标签，不要解释。\n\n片段：\n{current_chunk}"
+  },
+  "Extract_General": {
+    "name": "通用设定提取",
+    "description": "从任意小说片段中提取客观设定",
+    "content": "你是客观中立的小说设定提取器。只提取事实，不润色，不评价。\n\n分类输出：\n1. 人物更新：新角色、身份、关系变化、状态变化。\n2. 世界规则：地点、组织、社会规则、能力规则。\n3. 事件推进：已经发生的关键事件、结果、时间线锚点。\n4. 伏笔追踪：新伏笔、未解问题、刚揭开的答案。\n5. 冲突检测：若与参考背景矛盾，列出新旧冲突。\n\n参考背景：\n{context_memory}\n\n当前片段：\n{current_chunk}"
+  },
+  "Extract_System": {
+    "name": "系统/金手指设定提取",
+    "description": "提取系统、能力、限制和代价",
+    "content": "提取系统或金手指相关事实：绑定对象、能力、触发条件、限制、代价、状态变化、已解锁功能、禁止事项。若无新增，写无新增。\n\n参考背景：\n{context_memory}\n\n当前片段：\n{current_chunk}"
+  },
+  "Extract_Romance": {
+    "name": "情感线设定提取",
+    "description": "提取人物关系、情绪转折和感情进度",
+    "content": "提取情感线事实：关系阶段、误会、承诺、冲突、和解、外部阻力、角色态度变化。只写客观发生的事，不脑补。\n\n参考背景：\n{context_memory}\n\n当前片段：\n{current_chunk}"
+  },
+  "Extract_Suspense": {
+    "name": "悬疑线索提取",
+    "description": "提取线索、证据、嫌疑、谜题和揭示进度",
+    "content": "提取悬疑线事实：线索、证据、嫌疑人、伪线索、已确认真相、未解谜题、禁止提前揭示风险。只记录文本已明确给出的内容。\n\n参考背景：\n{context_memory}\n\n当前片段：\n{current_chunk}"
+  },
+  "Extract_Xuanhuan": {
+    "name": "玄幻/修仙设定提取",
+    "description": "提取力量体系、势力、道具和规则",
+    "content": "提取玄幻/修仙事实：境界、功法、血脉、法宝、宗门势力、资源、秘境、天道规则、突破条件。若有冲突，列出冲突。\n\n参考背景：\n{context_memory}\n\n当前片段：\n{current_chunk}"
+  },
+  "Extract_Historical": {
+    "name": "历史/年代设定提取",
+    "description": "提取时代背景、家庭关系、制度和资源",
+    "content": "提取历史/年代题材事实：年代、地区、家庭关系、职业单位、政策制度、物资资源、社会关系、时间线节点。不要写现代设定。\n\n参考背景：\n{context_memory}\n\n当前片段：\n{current_chunk}"
+  }
+}
