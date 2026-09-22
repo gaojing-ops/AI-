@@ -2,6 +2,8 @@
 
 当前同步包含正式提交、状态提取、证据审计、有界重试、无界面入口以及回归测试。具体小说进度只在本地projects中维护，未上传到本仓库。
 
+源码提交e0b7322b2125c7b4ad8af8a26b903d70da5fc15f已推送main，并由git远端引用及GitHub API读回确认。推送后独立检出复测570 passed、181 subtests、7.77秒；本次仅源码同步，不是小说发布。
+
 2026-09-22本地全套测试：570 passed、181 subtests。真实提供商调用和GUI人工验收尚未执行，测试通过不是小说质量或发布许可。
 
 开始前阅读WORKLOG.md及开发状态.md。安装requirements.txt后使用Python 3.14；运行测试另需pytest。不要上传真实config.json、projects、.runtime或本地完整台账。
