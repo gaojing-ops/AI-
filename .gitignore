@@ -1,6 +1,16 @@
 # Local/private runtime config
 config.json
 gui_last_project.json
+.runtime/
+.tools/
+research/
+temp_*
+.candidate_*.py
+fix_candidate*.py
+restore_candidate.py
+test_quote.py
+open_debts.txt
+project_config.json
 *_with_key*.json
 
 # Generated writing output
@@ -8,6 +18,7 @@ output/
 publish/
 logs/
 history/
+projects/
 
 # User manuscript assets beyond starter templates
 characters/*.txt
@@ -22,6 +33,7 @@ cover_*.png
 
 # Python/cache/build
 __pycache__/
+.pytest*/
 *.pyc
 *.pyo
 *.exe

@@ -236,7 +236,7 @@ def create_skill_template():
     return {
         "id": "my_custom_skill",
         "name": "我的自定义技能",
-        "icon": "🔧",
+        "icon": "",
         "category": "other",
         "description": "在这里描述你的技能做什么",
         "role_persona": "你是一个专业的...",
@@ -291,12 +291,12 @@ def delete_skill(skill_id, skills_dir=None):
 # 工具函数
 # ============================================================
 CATEGORY_LABELS = {
-    "editing": "📝 润色与编辑",
-    "quality": "🔍 质检与校对",
-    "memory": "🧠 记忆管理",
-    "planning": "📋 大纲与规划",
-    "creative": "💡 创意与灵感",
-    "other": "🔧 其他",
+    "editing": " 润色与编辑",
+    "quality": " 质检与校对",
+    "memory": "记忆管理",
+    "planning": " 大纲与规划",
+        "creative": "创意与灵感",
+    "other": " 其他",
 }
 
 CATEGORY_ORDER = ["editing", "quality", "memory", "planning", "creative", "other"]
@@ -304,12 +304,12 @@ CATEGORY_ORDER = ["editing", "quality", "memory", "planning", "creative", "other
 
 def get_category_label(category):
     """获取分类的中文标签"""
-    return CATEGORY_LABELS.get(category, f"🔧 {category}")
+    return CATEGORY_LABELS.get(category, f" {category}")
 
 
 def get_skill_display_text(skill):
     """获取 Skill 的显示文本（图标 + 名称）"""
-    icon = skill.get("icon", "🔧")
+    icon = skill.get("icon", "")
     name = skill.get("name", "未命名")
     return f"{icon} {name}"
 
@@ -328,10 +328,10 @@ if __name__ == "__main__":
     all_skills = load_all_skills()
     print(f"已加载 {len(all_skills)} 个技能：")
     for sid, skill in all_skills.items():
-        icon = skill.get("icon", "🔧")
+        icon = skill.get("icon", "")
         name = skill.get("name", "?")
         cat = skill.get("category", "other")
         desc = skill.get("description", "")
         print(f"  {icon} {name} [{cat}] - {desc}")
     
-    print("\n✅ Skill 引擎自检通过！")
+    print("\n[OK] Skill 引擎自检通过！")
