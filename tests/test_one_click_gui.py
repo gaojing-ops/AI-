@@ -133,6 +133,86 @@ class OneClickGuiTests(unittest.TestCase):
                 "",
             )
 
+    def test_generation_budget_preserves_truth_and_full_user_request(self):
+        app = self.make_app()
+        app._estimate_token_count = len
+        app._append_batch_audit = mock.Mock()
+        system = '<source_of_truth>\n' + '设定' * 5000 + '\n</source_of_truth>'
+        user = '当前要求' * 3000
+        actual_system, actual_user, report = app._apply_generation_prompt_budget(system, user)
+        self.assertEqual((system, user), (actual_system, actual_user))
+        self.assertFalse(report['trimmed'])
+        self.assertEqual('prompt_budget', app._append_batch_audit.call_args.args[0]['event'])
+
+    def test_generation_overflow_blocks_before_manual_model_call(self):
+        app = self.make_app()
+        app._estimate_token_count = len
+        app._append_batch_audit = mock.Mock()
+        app._ui_clear = mock.Mock()
+        app._finish_project_task = mock.Mock()
+        app.update_word_count = mock.Mock()
+        app._before_model_call = mock.Mock()
+        app._call_generation_text = mock.Mock()
+        app.stream_call_llm('rules', '正文' * 8000)
+        app._before_model_call.assert_not_called()
+        app._call_generation_text.assert_not_called()
+        self.assertFalse(app.is_generating)
+        self.assertEqual('BLOCKED', app._last_prompt_budget['status'])
+
+    def test_state_budget_reserves_core_and_fits_history_in_remaining_space(self):
+        app = self.make_app()
+        app._estimate_token_count = len
+        app._append_batch_audit = mock.Mock()
+        app._formal_suffix_emit_progress = mock.Mock()
+        app.STATE_USER_CHAR_CAP = 650
+        app.call_llm_review = mock.Mock(return_value='{}')
+        history = [{'issues': ['超长反馈' * 2000, '短反馈原句。']}]
+        app._call_state_review('规则', '核心证据' * 40, chapter=1, attempt=1,
+                               phase='局部状态修复', temp=0, repair_history=history)
+        prompt = app.call_llm_review.call_args.args[1]
+        self.assertTrue(prompt.startswith('核心证据' * 40))
+        self.assertIn('短反馈原句。', prompt)
+        self.assertNotIn('超长反馈', prompt)
+        self.assertLessEqual(len(prompt), 650)
+
+    def test_state_overflow_never_calls_model_or_consumes_rejection_budget(self):
+        app = self.make_app(structured_state_enabled=True, temporal_memory_enabled=False)
+        app.STATE_SYSTEM_CHAR_CAP = 1
+        app._estimate_token_count = len
+        app._append_batch_audit = mock.Mock()
+        app.call_llm_review = mock.Mock()
+        rejected = mock.Mock()
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(generator.DIRS, {'plot': root}):
+            with self.assertRaisesRegex(gui_app.state_ledger.StateExtractionError, 'PROMPT_BUDGET_EXCEEDED'):
+                app._prepare_structured_state_delta(1, '林舟上车。', rejection_callback=rejected)
+            self.assertFalse(os.path.exists(os.path.join(root, 'story_state.json')))
+        app.call_llm_review.assert_not_called()
+        rejected.assert_not_called()
+        self.assertFalse(app._state_ledger_call_active)
+
+    def test_independent_audit_budget_block_is_not_a_content_rejection(self):
+        app = self.make_app(structured_state_enabled=True, temporal_memory_enabled=False)
+        app._estimate_token_count = len
+        app._append_batch_audit = mock.Mock()
+        app.STATE_USER_CHAR_CAP = 25000
+        chapter = '林舟上车。'
+        delta = {'chapter': 1, 'events': [{'event_type': 'world', 'summary': '林舟上车',
+                                         'evidence_quote': chapter}]}
+        app.call_llm_review = mock.Mock(return_value=json.dumps(delta))
+        rejected = mock.Mock()
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(generator.DIRS, {'plot': root}), \
+             mock.patch.object(gui_app.state_ledger, 'build_delta_audit_prompts', return_value=('审计', '证据' * 20000)):
+            with self.assertRaisesRegex(gui_app.state_ledger.StateExtractionError, 'PROMPT_BUDGET_EXCEEDED'):
+                app._prepare_structured_state_delta(1, chapter, rejection_callback=rejected)
+        self.assertEqual(1, app.call_llm_review.call_count)
+        rejected.assert_not_called()
+
+    def test_prompt_budget_module_is_in_preflight_fingerprint(self):
+        app = self.make_app()
+        with mock.patch.object(gui_app.formal_suffix_rewrite, 'build_preflight_fingerprint') as fingerprint:
+            app._formal_suffix_code_fingerprint()
+        self.assertNotEqual('missing', fingerprint.call_args.args[0]['prompt_budget.py'])
+
     def test_legacy_evidence_boundary_exempts_only_sealed_prefix(self):
         app = self.make_app(legacy_evidence_exempt_through_chapter=30)
 
@@ -1062,15 +1142,15 @@ class OneClickGuiTests(unittest.TestCase):
         app._commercial_review_call_active = True
         app._commercial_review_stage_remaining = 3
         app._commercial_review_fallback_eligible = 0
-        for _ in range(3):
+        for _ in range(2):
             app._before_model_call()
             app._commercial_review_fallback_call_active = True
             app._before_model_call()
             app._commercial_review_fallback_call_active = False
 
-        self.assertEqual(0, app._commercial_review_stage_remaining)
+        self.assertEqual(1, app._commercial_review_stage_remaining)
         self.assertEqual(0, app._commercial_review_fallback_eligible)
-        with self.assertRaisesRegex(RuntimeError, "分块预算"):
+        with self.assertRaisesRegex(RuntimeError, "单章硬上限 16 次"):
             app._before_model_call()
         app._commercial_review_fallback_call_active = True
         with self.assertRaisesRegex(RuntimeError, "回退额度"):
@@ -1672,9 +1752,35 @@ class OneClickGuiTests(unittest.TestCase):
         self.assertEqual('林舟收好钥匙', prepared['delta']['events'][0]['summary'])
         self.assertEqual(4, app.call_llm_review.call_count)
         self.assertIn('只输出局部JSON补丁', app.call_llm_review.call_args_list[2].args[1])
+        self.assertIn('历史拒绝反馈', app.call_llm_review.call_args_list[2].args[1])
+        self.assertIn('独立地点条目', app.call_llm_review.call_args_list[2].args[1])
         starts = [r for r in progress if r['event'] == 'state_model_call_started']
         self.assertEqual(['状态提取', '独立证据审计', '局部状态修复', '独立证据审计'], [r['phase'] for r in starts])
         self.assertTrue(all('elapsed_seconds' in r for r in progress if r['event'] == 'state_model_call_completed'))
+
+    def test_restart_repair_prompt_keeps_older_feedback_without_expanding_permissions(self):
+        app = self.make_app(structured_state_enabled=True, state_delta_max_attempts=1,
+                            state_delta_independent_audit=True, temporal_memory_enabled=False)
+        app._append_batch_audit = lambda payload: None
+        chapter = '林舟离开旧站。'
+        delta = {'chapter': 1, 'events': [{'event_type': 'world', 'summary': '林舟离开旧站',
+                                          'evidence_quote': chapter}]}
+        history = gui_app.state_repair.record([], delta, [
+            'events[0] 旧反馈：不能把计划记为完成', 'events[0] 最新反馈：摘要核对'])
+        context = {'schema_version': 1, 'status': 'REJECTED', 'chapter': 1,
+                   'chapter_sha256': gui_app.state_ledger.chapter_sha256(chapter),
+                   'previous_raw': json.dumps(delta), 'issues': history[-1]['issues'],
+                   'repair_history': history}
+        app.call_llm_review = mock.Mock(side_effect=[json.dumps({'updates': {}}),
+            json.dumps({'pass': True, 'reject': [], 'missing': []})])
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(generator.DIRS, {'plot': root}):
+            prepared = app._prepare_structured_state_delta(1, chapter, repair_context=context)
+            self.assertFalse(os.path.exists(os.path.join(root, 'story_state.json')))
+        prompt = app.call_llm_review.call_args_list[0].args[1]
+        self.assertIn('旧反馈', prompt)
+        self.assertIn('最新反馈', prompt)
+        self.assertIn('不扩大本轮补丁权限', prompt)
+        self.assertEqual('林舟离开旧站', prepared['delta']['events'][0]['summary'])
 
     def test_repeated_state_rejections_persist_and_stop_next_invocation_before_model(self):
         app = self.make_app(structured_state_enabled=True, state_delta_max_attempts=1,
@@ -1697,6 +1803,56 @@ class OneClickGuiTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(root, 'story_state.json')))
         self.assertEqual(2, len(contexts[-1]['repair_history']))
         self.assertEqual('state_only', contexts[-1]['repair_scope'])
+
+    def test_one_rejection_budget_stops_runtime_and_resume_without_new_calls(self):
+        for limit in (1, '1', 0):
+            with self.subTest(limit=limit):
+                app = self.make_app(structured_state_enabled=True, state_delta_max_attempts=3,
+                                    state_repair_max_rejections=limit,
+                                    state_delta_independent_audit=True, temporal_memory_enabled=False)
+                app._append_batch_audit = lambda payload: None
+                chapter = '林舟离开旧站。'
+                delta = {'chapter': 1, 'events': [{'event_type': 'world', 'summary': '林舟离开旧站',
+                                                 'evidence_quote': chapter}]}
+                reject = {'pass': False, 'reject': [{'path': 'events[0]', 'reason': '摘要未通过',
+                                                     'draft_quote': chapter}]}
+                contexts = []
+                app.call_llm_review = mock.Mock(side_effect=[json.dumps(delta), json.dumps(reject)])
+                with tempfile.TemporaryDirectory() as root, mock.patch.dict(generator.DIRS, {'plot': root}):
+                    with self.assertRaisesRegex(gui_app.state_ledger.StateExtractionError, 'STATE_REPAIR_STOPPED'):
+                        app._prepare_structured_state_delta(1, chapter, rejection_callback=contexts.append)
+                    self.assertEqual(2, app.call_llm_review.call_count)  # extraction + independent audit
+                    self.assertEqual(1, len(contexts[-1]['repair_history']))
+                    app.call_llm_review = mock.Mock()
+                    with self.assertRaisesRegex(gui_app.state_ledger.StateExtractionError, 'STATE_REPAIR_STOPPED'):
+                        app._prepare_structured_state_delta(1, chapter, repair_context=contexts[-1])
+                    app.call_llm_review.assert_not_called()
+                    self.assertFalse(os.path.exists(os.path.join(root, 'story_state.json')))
+
+    def test_stalled_state_stops_runtime_despite_changing_audit_wording(self):
+        app = self.make_app(structured_state_enabled=True, state_delta_max_attempts=3,
+                            state_delta_independent_audit=True, temporal_memory_enabled=False)
+        app._append_batch_audit = lambda payload: None
+        chapter = '林舟离开旧站。'
+        delta = {'chapter': 1, 'events': [{'event_type': 'world', 'summary': '林舟离开旧站',
+                                         'evidence_quote': chapter}]}
+        responses = []
+        for index in range(3):
+            responses.extend([json.dumps(delta if index == 0 else {'updates': {}}),
+                json.dumps({'pass': False, 'reject': [{'path': 'events[0]', 'reason': f'不同意见{index}',
+                                                      'draft_quote': chapter}]})])
+        contexts = []
+        app.call_llm_review = mock.Mock(side_effect=responses)
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(generator.DIRS, {'plot': root}):
+            with self.assertRaisesRegex(gui_app.state_ledger.StateExtractionError, '累计2轮'):
+                app._prepare_structured_state_delta(1, chapter, rejection_callback=contexts.append)
+            self.assertEqual(4, app.call_llm_review.call_count)
+            self.assertEqual(2, len(contexts[-1]['repair_history']))
+            app.call_llm_review = mock.Mock()
+            with self.assertRaisesRegex(gui_app.state_ledger.StateExtractionError, 'STATE_REPAIR_STOPPED'):
+                app._prepare_structured_state_delta(1, chapter, repair_context=contexts[-1])
+            app.call_llm_review.assert_not_called()
+            self.assertFalse(os.path.exists(os.path.join(root, 'story_state.json')))
 
     def test_state_failure_preserves_candidate_across_restart_instead_of_rewriting(self):
         app = self.make_app()
@@ -1973,7 +2129,7 @@ class OneClickGuiTests(unittest.TestCase):
             except RuntimeError:
                 self.assertTrue(fail)
             rows = [call.args[0] for call in app._append_batch_audit.call_args_list]
-            self.assertEqual(['state_model_call_started', 'state_model_call_failed' if fail else 'state_model_call_completed'],
+            self.assertEqual(['prompt_budget', 'state_model_call_started', 'state_model_call_failed' if fail else 'state_model_call_completed'],
                              [row['event'] for row in rows])
             self.assertIn('elapsed_seconds', rows[-1])
             messages = ''.join(call.args[0] for call in app._ui_progress_append.call_args_list)

@@ -18,7 +18,9 @@ output/
 publish/
 logs/
 history/
-projects/
+projects/*
+!projects/.gitkeep
+tmp/
 
 # User manuscript assets beyond starter templates
 characters/*.txt

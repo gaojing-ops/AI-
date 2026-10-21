@@ -45,18 +45,18 @@ class ModelRoutingTests(unittest.TestCase):
             gui_app.resolve_preset_model(preset, config, review=True),
         )
 
-    def test_legacy_deepseek_aliases_migrate_to_v4_defaults(self):
+    def test_legacy_deepseek_choices_are_not_silently_migrated(self):
         preset = gui_app.MODEL_PRESETS["DeepSeek-V4"]
         config = {
             "model": "deepseek-chat",
             "review_model": "deepseek-reasoner",
         }
         self.assertEqual(
-            "deepseek-v4-flash",
+            "deepseek-chat",
             gui_app.resolve_preset_model(preset, config, review=False),
         )
         self.assertEqual(
-            "deepseek-v4-pro",
+            "deepseek-reasoner",
             gui_app.resolve_preset_model(preset, config, review=True),
         )
 

@@ -36,6 +36,13 @@ def describe_preflight_progress(row, now=None):
     return detail
 
 
+def relay_preflight_progress(notify, row):
+    """Keep substage phase instead of passing the same keyword twice."""
+    fields = {"phase": "isolated_preflight", **dict(row or {})}
+    event = str(fields.pop("event", None) or "isolated_preflight_progress")
+    notify(event, **fields)
+
+
 class StaticVar:
     def __init__(self, value=True):
         self.value = value
@@ -366,9 +373,11 @@ class HeadlessNovelGenerator(gui_app.NovelGeneratorGUI):
                 start_chapter=start,
                 end_chapter=end,
             )
+            temp_base = Path(real_project.anchor) / "CodexTemp" / "NovelPreflight"
+            temp_base.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(
                 prefix="nsp_",
-                dir=str(Path(real_project.anchor)),
+                dir=str(temp_base),
             ) as temp_root:
                 isolated_project = Path(temp_root) / "p"
                 isolated_project, isolated_candidates = (
@@ -382,20 +391,15 @@ class HeadlessNovelGenerator(gui_app.NovelGeneratorGUI):
                     isolated_project,
                     echo_progress=False,
                 )
+                # Attempts survive disposal of this sandbox, including crashes;
+                # only the budget sidecar is shared, never prose/canon receipts.
+                staged_app._chapter_budget_project = str(real_project)
                 if micro_budget:
                     staged_app._model_call_count = 0
                     staged_app._model_call_limit = micro_budget
 
                 def staged_progress(row):
-                    notify(
-                        str((row or {}).get("event") or "isolated_preflight_progress"),
-                        phase="isolated_preflight",
-                        **{
-                            key: value
-                            for key, value in dict(row or {}).items()
-                            if key != "event"
-                        },
-                    )
+                    relay_preflight_progress(notify, row)
 
                 staged_result = None
                 staged_failure = None

@@ -27,6 +27,7 @@ import re
 from datetime import datetime
 from openai import OpenAI
 import glob
+import local_credentials
 
 # ============================================================
 # 系统基础配置
@@ -61,7 +62,7 @@ def default_config():
         "codex_timeout_seconds": 900,
         "api_key": "YOUR_DEEPSEEK_API_KEY_HERE",
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "review_model": "deepseek-v4-pro",
         "temperature": 0.8,
         "max_tokens": 8192,
@@ -95,7 +96,10 @@ def get_runtime_api_key(config_data=None):
     env_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if env_key:
         return env_key
-    saved_key = str((config_data or config).get("api_key") or "").strip()
+    selected = config if config_data is None else config_data
+    if selected.get("credential_store") == "windows_dpapi":
+        return local_credentials.load_key()
+    saved_key = str(selected.get("api_key") or "").strip()
     if saved_key == "YOUR_DEEPSEEK_API_KEY_HERE":
         return ""
     return saved_key

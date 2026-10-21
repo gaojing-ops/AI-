@@ -49,6 +49,12 @@ def classify_failure(reason):
     text = str(reason or "")
     lowered = text.lower()
 
+    if any(marker in lowered for marker in (
+        "chapter_budget_stopped", "prompt_budget_exceeded", "timeout", "timed out",
+        "connection error", "rate limit", "error code: 429",
+    )) or any(marker in text for marker in ("服务调用失败", "服务不可用", "质检裸奔", "预算无法", "调用已达到")):
+        return "api"
+
     if "insufficient balance" in lowered or "余额不足" in text or "error code: 402" in lowered:
         return "api"
     if "内容为空" in text or "未能生成" in text or "空稿" in text:

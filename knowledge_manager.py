@@ -14,6 +14,7 @@ import shutil
 from datetime import datetime
 
 import story_architect
+from source_context import SourceBudgetError, select_whole_sources
 
 
 FACT_DB_FILENAME = "关键事实库.json"
@@ -409,51 +410,120 @@ def _clip_keep_ends(text, limit):
     return text[:head].rstrip() + "\n[中段已截断，保留最新尾部]\n" + text[-tail:].lstrip()
 
 
-def build_generation_context(plot_dir, chap_num, max_chars=3200, include_sources=True):
+def select_generation_context(plot_dir, chap_num, max_chars=3200, include_sources=True):
+    """Select complete stored records and full memory files, without writes.
+
+    The recent eight-chapter window is explicit; records are not full prose.
+    None defers ordinary sizing to the caller, with a 128000 source hard cap.
+    Cached file excerpts are not evidence of a complete source.
+    """
     db = load_fact_db(plot_dir)
-    parts = []
+    if db.get("load_error"):
+        raise SourceBudgetError("PROMPT_BUDGET_EXCEEDED：事实库不可解析，拒绝用空事实继续；请先恢复来源")
+    if type(chap_num) is not int or chap_num < 0 or type(include_sources) is not bool:
+        raise SourceBudgetError("PROMPT_BUDGET_EXCEEDED：事实选择章节或来源开关无效")
+    rows = {}
+    chapter_map = db.get("chapters", {})
+    recent_cache = db.get("recent_chapters", [])
+    snapshots = db.get("sources", {})
+    if not isinstance(chapter_map, dict) or not isinstance(recent_cache, list) or not isinstance(snapshots, dict):
+        raise SourceBudgetError("PROMPT_BUDGET_EXCEEDED：事实库章节或来源结构无效")
 
-    recent = db.get("recent_chapters") or []
+    def chapter_number(value):
+        if type(value) is int and value >= 0:
+            return value
+        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+            return int(value)
+        raise SourceBudgetError("PROMPT_BUDGET_EXCEEDED：事实库章节号无效")
+
+    for key, item in chapter_map.items():
+        if not isinstance(item, dict):
+            raise SourceBudgetError("PROMPT_BUDGET_EXCEEDED：事实库章节条目无效")
+        number = chapter_number(item.get("chapter", key))
+        if not number or number != chapter_number(key):
+            raise SourceBudgetError("PROMPT_BUDGET_EXCEEDED：事实库章节绑定不一致")
+        rows[number] = item
+    for item in recent_cache:
+        if not isinstance(item, dict):
+            raise SourceBudgetError("PROMPT_BUDGET_EXCEEDED：近期事实条目无效")
+        number = chapter_number(item.get("chapter"))
+        if not number:
+            raise SourceBudgetError("PROMPT_BUDGET_EXCEEDED：近期事实章节号必须大于零")
+        # Durable chapter records take precedence over the rolling cache.
+        rows.setdefault(number, item)
+    latest = max([chapter_number(db.get("latest_chapter") or 0),
+                  chapter_number(db.get("current_chapter") or 0), *rows.keys()])
+    before = chap_num or latest + 1
+    eligible_numbers = sorted(number for number in rows if number < before)
+    selected_numbers = eligible_numbers[-8:]
+    recent = [rows[number] for number in selected_numbers]
+    sources = [{"label": "近期事实选择范围", "category": "fact_window", "required": True,
+                "text": f"只选第{before}章之前最近8章的完整已存记录（不是章节全文）。"
+                        f"本次纳入：{'、'.join(str(n) for n in selected_numbers) or '无'}；"
+                        "更早记录不在此近期窗口，不能据此推定历史事实不存在。"}]
+    for number, item in zip(selected_numbers, recent):
+        sources.append({"label": f"第{number}章近期事实", "category": "recent_fact", "required": True,
+                        "text": f"标题：{item.get('title') or ''}；章尾钩子：{item.get('tail_hook') or ''}"})
     if recent:
-        lines = []
-        for item in recent[-8:]:
-            lines.append(
-                f"- 第{item.get('chapter')}章：{item.get('title', '')}；"
-                f"章尾钩子：{_clip(item.get('tail_hook', ''), 90)}"
-            )
-        parts.append("【近期章节事实】\n" + "\n".join(lines))
-
         aggregate = {phrase: 0 for phrase in STYLE_PHRASE_LIMITS}
-        for item in recent[-8:]:
-            for phrase, count in (item.get("style_phrase_counts") or {}).items():
+        for item in recent:
+            counts = item.get("style_phrase_counts") or {}
+            if not isinstance(counts, dict):
+                raise SourceBudgetError("PROMPT_BUDGET_EXCEEDED：近期表达计数结构无效")
+            for phrase, count in counts.items():
                 if phrase in aggregate:
-                    aggregate[phrase] += int(count or 0)
+                    aggregate[phrase] += chapter_number(count or 0)
         overused = [
             phrase for phrase, limit in STYLE_PHRASE_LIMITS.items()
             if aggregate.get(phrase, 0) >= limit
         ]
         if overused:
-            parts.append(
-                "【近期高频表达禁用】\n下一章不要再使用：" + "、".join(overused)
-                + "。改用具体动作、现场声音或直接叙事。"
-            )
+            sources.append({"label": "近期高频表达禁用", "category": "style_hint", "required": False,
+                            "text": "下一章不要再使用：" + "、".join(overused)
+                                    + "。改用具体动作、现场声音或直接叙事。"})
 
     if include_sources:
-        source_budget = max(1200, max_chars - sum(len(p) for p in parts))
-        per_source = max(350, source_budget // max(1, len(SOURCE_FILES)))
+        blocked_terms = story_architect.blocked_terms_for_chapter(plot_dir, before)
         for filename in SOURCE_FILES:
-            snapshot = (db.get("sources") or {}).get(filename)
-            if snapshot and snapshot.get("excerpt"):
-                parts.append(f"【{filename}】\n{_clip(snapshot.get('excerpt', ''), per_source)}")
-            else:
-                raw = _read_text(os.path.join(plot_dir, filename))
-                if raw:
-                    parts.append(f"【{filename}】\n{_clip(raw, per_source)}")
+            if latest >= before:
+                sources.append({"label": filename, "category": "memory_source", "text": "",
+                                "eligible": False, "reason": "future_memory_source"})
+                continue
+            raw = _read_text(os.path.join(plot_dir, filename))
+            if not raw:
+                if os.path.exists(os.path.join(plot_dir, filename)) or snapshots.get(filename):
+                    raise SourceBudgetError(f"PROMPT_BUDGET_EXCEEDED：{filename}完整原文件缺失或不可读；"
+                                            "拒绝用缓存摘录替代，未发起模型")
+                sources.append({"label": filename, "category": "memory_source", "text": "",
+                                "eligible": False, "reason": "absent_source"})
+                continue
+            source_boundary = re.search(r"第\s*(\d+)\s*章后", raw[:256])
+            future = bool(source_boundary and int(source_boundary.group(1)) >= before)
+            for term in blocked_terms:
+                raw = raw.replace(term, "后期未公开内容")
+            sources.append({"label": filename, "category": "memory_source", "text": raw,
+                            "required": True, "eligible": not future, "reason": "future_memory_source"})
+        future_sources = [source["label"] for source in sources
+                          if source.get("reason") == "future_memory_source" and not source.get("eligible", True)]
+        if future_sources:
+            sources.append({"label": "记忆资料时点说明", "category": "source_boundary", "required": True,
+                            "text": "下列资料包含目标章及之后状态，已整份排除：" + "、".join(future_sources)
+                                    + "。应使用对应前序副本补齐；不得自行推定缺失人物、物品或事件状态。"})
+    result = select_whole_sources(sources, 128000 if max_chars is None else max_chars)
+    result["metadata"].update({
+        "requested_budget_chars": max_chars, "requested_chapter": chap_num,
+        "before_chapter": before, "recent_window_chapters": 8,
+        "view": "complete_stored_records_not_full_chapters",
+        "selected_recent_chapters": selected_numbers,
+        "older_outside_window": eligible_numbers[:-8],
+        "future_chapters_excluded": sorted(number for number in rows if number >= before),
+        "source_latest_chapter": latest,
+    })
+    return result
 
-    text = "\n\n".join(part for part in parts if part.strip())
-    if not text:
-        return ""
-    return _clip(text, max_chars)
+
+def build_generation_context(plot_dir, chap_num, max_chars=3200, include_sources=True):
+    return select_generation_context(plot_dir, chap_num, max_chars, include_sources)["text"]
 
 
 def _managed_header(chap_num):

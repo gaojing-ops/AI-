@@ -176,6 +176,7 @@ class CommercialReviewerTests(unittest.TestCase):
         debt = {
             "items": [
                 {
+                    "id": "debt_mainline",
                     "status": "OPEN",
                     "opened_chapter": 10,
                     "action": "第20章前兑现主卖点",
@@ -183,7 +184,8 @@ class CommercialReviewerTests(unittest.TestCase):
             ]
         }
         partial = {"debt_status": "PARTIAL"}
-        resolved = {"debt_status": "RESOLVED"}
+        resolved = {"debt_status": "RESOLVED",
+                    "debt_evidence": ["debt_mainline|VERIFIED|第29章主卖点已经实际兑现"]}
         self.assertTrue(
             commercial_reviewer.hard_gate_debt_blocked(
                 30, partial, debt, config, ranges
@@ -192,6 +194,11 @@ class CommercialReviewerTests(unittest.TestCase):
         self.assertFalse(
             commercial_reviewer.hard_gate_debt_blocked(
                 30, resolved, debt, config, ranges
+            )
+        )
+        self.assertTrue(
+            commercial_reviewer.hard_gate_debt_blocked(
+                30, {"debt_status": "RESOLVED"}, debt, config, ranges
             )
         )
         self.assertFalse(
@@ -559,7 +566,7 @@ class CommercialReviewerTests(unittest.TestCase):
             rendered = commercial_reviewer.render_revision_debt(
                 debt, current_chapter=14
             )
-            self.assertIn("已逾期", rendered)
+            self.assertIn("复核点已过", rendered)
 
             debt_id = debt["items"][0]["id"]
 

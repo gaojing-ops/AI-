@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 
 import story_architect
+from source_context import require_complete_source
 
 
 CANON_FILENAME = "canon_state.json"
@@ -381,8 +382,8 @@ def build_canon_context(plot_dir, max_chars=2200):
         value = canon.get(key)
         if value not in (None, "", []):
             lines.append(f"- {label}：{value}")
-    # Identity and item lifecycle rules must stay ahead of growing event history.
-    # The final truncation may discard old events, but never these hard facts.
+    # The rendered hard facts and event history form one required source.
+    # Ordering does not justify dropping an earlier fact or cutting a rule.
     identity_facts = canon.get("identity_facts") or []
     if identity_facts:
         lines.append("- 人物身份硬事实：" + "；".join(str(x) for x in identity_facts))
@@ -397,9 +398,9 @@ def build_canon_context(plot_dir, max_chars=2200):
         lines.append("- 禁止写入的错误事实：" + "；".join(str(x) for x in false_facts))
     completed = canon.get("completed_events") or []
     if completed:
-        lines.append("- 已完成事件，禁止重演：" + "；".join(str(x) for x in completed[-10:]))
+        lines.append("- 已完成事件，禁止重演：" + "；".join(str(x) for x in completed))
     text = "\n".join(lines)
-    return text[:max_chars]
+    return require_complete_source(text, max_chars, "不可覆盖的正史状态")
 
 
 def _append_structured_violations(issues, text, chap_num, canon):

@@ -11,6 +11,11 @@ import re
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from source_context import SourceBudgetError
+
+
+class BlueprintBudgetError(SourceBudgetError):
+    """An incomplete blueprint must use the existing no-retry budget stop."""
 
 
 SCHEMA_VERSION = 1
@@ -433,4 +438,14 @@ def render_blueprint(blueprint, max_chars=7000):
         "高风险：" + "；".join(str(item) for item in (data.get("failure_risks") or [])),
         "必须避免：" + "；".join(str(item) for item in (data.get("must_avoid") or [])),
     ]
-    return "\n".join(lines)[:max_chars]
+    text = "\n".join(lines)
+    if max_chars is None:
+        return text
+    if type(max_chars) is not int or not 1 <= max_chars <= 128000:
+        raise BlueprintBudgetError("商业蓝图呈现预算必须为1—128000整数字符数，或None表示完整呈现")
+    if len(text) > max_chars:
+        raise BlueprintBudgetError(
+            f"完整商业蓝图需{len(text)}字符，预算{max_chars}；未截断",
+            {"status": "BLOCKED", "source_label": "商业立项执行合同",
+             "required_chars": len(text), "max_chars": max_chars, "used_chars": 0})
+    return text

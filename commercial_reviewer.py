@@ -14,8 +14,11 @@ DEFAULT_MILESTONES = (3, 10, 30)
 DEFAULT_HARD_GATES = (3, 30)
 REVISION_DEBT_SCHEMA_VERSION = 1
 REVIEW_SEVERITIES = {"BLOCKER", "REVISION", "ADVISORY"}
-REVIEW_RECEIPT_VERSION = 1
-MULTI_REVIEW_RECEIPT_VERSION = 2
+LEGACY_REVIEW_RECEIPT_VERSION = 1
+LEGACY_MULTI_REVIEW_RECEIPT_VERSION = 2
+REVIEW_RECEIPT_VERSION = 3
+MULTI_REVIEW_RECEIPT_VERSION = 4
+DEBT_EVIDENCE_LIMIT = 40
 
 
 def _int_list(values, fallback=DEFAULT_MILESTONES):
@@ -67,7 +70,7 @@ def hard_gate_debt_blocked(chapter_num, result, debt, config, volume_ranges=None
     open_items = [
         item for item in (debt or {}).get("items", [])
         if item.get("status") == "OPEN"
-        and int(item.get("opened_chapter") or 0) < chapter_num
+        and int(item.get("opened_chapter") or 0) <= chapter_num
         and (
             not int(item.get("due_by") or 0)
             or int(item.get("due_by") or 0) <= chapter_num
@@ -75,7 +78,19 @@ def hard_gate_debt_blocked(chapter_num, result, debt, config, volume_ranges=None
     ]
     if not open_items:
         return False
-    return str((result or {}).get("debt_status") or "PARTIAL").upper() != "RESOLVED"
+    evidence = (result or {}).get("debt_evidence") or []
+    if (bool((result or {}).get("malformed"))
+            or str((result or {}).get("debt_status") or "PARTIAL").upper() != "RESOLVED"
+            or not isinstance(evidence, list) or len(evidence) > DEBT_EVIDENCE_LIMIT):
+        return True
+    # RESOLVED only says the response is complete. Each actually due debt
+    # still requires its own explicit proof before the normal commit closes it.
+    return any(
+        not str(item.get("id") or "").strip()
+        or {_debt_evidence_status(row, item["id"]) for row in evidence
+            if _debt_evidence_status(row, item["id"])} != {"VERIFIED"}
+        for item in open_items
+    )
 
 
 def should_run(chapter_num, config, volume_ranges=None):
@@ -309,7 +324,7 @@ NEXT_10_CHAPTERS:
 - 给出3条可执行调整，不得推翻正史和既定真相节奏
 DEBT_STATUS: RESOLVED
 DEBT_EVIDENCE:
-- 对上轮行动单逐条说明正文证据，格式必须是“debt_id|VERIFIED|第N章具体证据”或“debt_id|OPEN|未兑现/部分兑现/未到执行区间的原因”；只有 VERIFIED 会核销债务；首次审稿写“首次建立”
+- 最多40条完整证据；对上轮行动单逐条说明正文证据，格式必须是“debt_id|VERIFIED|第N章具体证据”或“debt_id|OPEN|未兑现/部分兑现/未到执行区间的原因”；只有 VERIFIED 会核销债务；首次审稿写“首次建立”
 
 判定规则：
 - PASS：可以按现方向继续扩大生产。
@@ -372,12 +387,18 @@ NEXT_10_CHAPTERS:
 - 3条可执行调整
 DEBT_STATUS: RESOLVED
 DEBT_EVIDENCE:
-- 每条格式必须是“debt_id|VERIFIED|第N章具体证据”或“debt_id|OPEN|未兑现/部分兑现/未到执行区间的原因”；只有 VERIFIED 会核销债务；首次审稿写“首次建立”
+- 最多40条完整证据；每条格式必须是“debt_id|VERIFIED|第N章具体证据”或“debt_id|OPEN|未兑现/部分兑现/未到执行区间的原因”；只有 VERIFIED 会核销债务；首次审稿写“首次建立”
 """
     return system_prompt, user_prompt
 
 
 def parse_review(raw):
+    """Parse new model output without silently dropping per-debt evidence."""
+    return _parse_review(raw)
+
+
+def _parse_review(raw, *, legacy_evidence=False):
+    """The eight-row projection is only for verifying unchanged v1/v2 receipts."""
     text = (raw or "").strip()
     if text.startswith("{"):
         duplicate_keys = []
@@ -419,6 +440,7 @@ def parse_review(raw):
                 and debt_status == "RESOLVED"
                 and bool(summary)
                 and bool(debt_evidence)
+                and (legacy_evidence or len(debt_evidence) <= DEBT_EVIDENCE_LIMIT)
             )
             return {
                 "status": overall if not malformed else "FAIL",
@@ -427,7 +449,7 @@ def parse_review(raw):
                 "summary": summary or text[:300],
                 "next_actions": next_actions[:5],
                 "debt_status": debt_status or "PARTIAL",
-                "debt_evidence": debt_evidence[:8],
+                "debt_evidence": debt_evidence[:8] if legacy_evidence else debt_evidence,
                 "raw": text,
                 "malformed": malformed,
             }
@@ -469,6 +491,7 @@ def parse_review(raw):
     debt_resolved = len(debt_matches) == 1 and debt_matches[0].upper() == "RESOLVED"
     malformed = not (
         terminal_unique and summary and debt_resolved and bool(debt_evidence)
+        and (legacy_evidence or len(debt_evidence) <= DEBT_EVIDENCE_LIMIT)
     )
     return {
         "status": overall_matches[0].upper() if len(overall_matches) == 1 and not malformed else "FAIL",
@@ -477,7 +500,7 @@ def parse_review(raw):
         "summary": summary.group(1).strip() if summary else text[:300],
         "next_actions": next_actions[:5],
         "debt_status": debt_matches[0].upper() if len(debt_matches) == 1 else "PARTIAL",
-        "debt_evidence": debt_evidence[:8],
+        "debt_evidence": debt_evidence[:8] if legacy_evidence else debt_evidence,
         "raw": text,
         "malformed": malformed,
     }
@@ -575,11 +598,14 @@ def verify_review_receipt(result, model_name=""):
     if not isinstance(receipt, dict):
         raise RuntimeError("商业审稿缺少自动审查调用收据")
     version = int(receipt.get("version") or 0)
-    if version not in {REVIEW_RECEIPT_VERSION, MULTI_REVIEW_RECEIPT_VERSION}:
+    if version not in {LEGACY_REVIEW_RECEIPT_VERSION, LEGACY_MULTI_REVIEW_RECEIPT_VERSION,
+                       REVIEW_RECEIPT_VERSION, MULTI_REVIEW_RECEIPT_VERSION}:
         raise RuntimeError("商业审稿调用收据版本无效")
     valid_origins = {
         REVIEW_RECEIPT_VERSION: "automatic_model_review",
         MULTI_REVIEW_RECEIPT_VERSION: "automatic_model_review_map_reduce",
+        LEGACY_REVIEW_RECEIPT_VERSION: "automatic_model_review",
+        LEGACY_MULTI_REVIEW_RECEIPT_VERSION: "automatic_model_review_map_reduce",
     }
     if receipt.get("origin") != valid_origins[version]:
         raise RuntimeError("人工回填不能形成商业审稿 PASS")
@@ -611,7 +637,8 @@ def verify_review_receipt(result, model_name=""):
         for value in result_hashes.values()
     ):
         raise RuntimeError("商业审稿逐章正文哈希无效")
-    if version == REVIEW_RECEIPT_VERSION:
+    legacy_evidence = version in {LEGACY_REVIEW_RECEIPT_VERSION, LEGACY_MULTI_REVIEW_RECEIPT_VERSION}
+    if version in {LEGACY_REVIEW_RECEIPT_VERSION, REVIEW_RECEIPT_VERSION}:
         for field in (
             "system_prompt_sha256",
             "user_prompt_sha256",
@@ -684,7 +711,7 @@ def verify_review_receipt(result, model_name=""):
                 int(item) for item in (stage.get("reviewed_chapters") or [])
             ]:
                 raise RuntimeError("分块商业审稿覆盖区间被修改")
-            parsed_map = parse_review(raw)
+            parsed_map = _parse_review(raw, legacy_evidence=legacy_evidence)
             for field in ("status", "current", "action"):
                 if str(map_review.get(field) or "").upper() != str(
                     parsed_map.get(field) or ""
@@ -708,7 +735,7 @@ def verify_review_receipt(result, model_name=""):
     if receipt.get("receipt_sha256") != _receipt_digest(receipt):
         raise RuntimeError("商业审稿调用收据已被修改")
 
-    parsed = parse_review((result or {}).get("raw") or "")
+    parsed = _parse_review((result or {}).get("raw") or "", legacy_evidence=legacy_evidence)
     for field in ("status", "current", "action"):
         if str((result or {}).get(field) or "").upper() != str(parsed.get(field) or "").upper():
             raise RuntimeError("商业审稿结构字段与模型原始结论不一致")
@@ -1015,24 +1042,35 @@ def update_revision_debt(path, chapter_num, result, horizon=10):
     items = data.setdefault("items", [])
     debt_status = str(result.get("debt_status") or "PARTIAL").upper()
     evidence = result.get("debt_evidence") or []
+    if not isinstance(evidence, list) or len(evidence) > DEBT_EVIDENCE_LIMIT:
+        raise RevisionDebtError("修订债务证据必须是最多40条的完整数组，拒绝截断落账")
+    if result.get("malformed"):
+        raise RevisionDebtError("结构无效的商业审稿不能更新修订债务")
+    evidence = [str(row) for row in evidence]
 
     for item in items:
         if item.get("status") != "OPEN":
             continue
-        item["last_reviewed_chapter"] = chapter_num
-        item["last_review_evidence"] = evidence[:8]
+        opened_chapter = int(item.get("opened_chapter") or 0)
+        if chapter_num < opened_chapter:
+            continue
         item_id = str(item.get("id") or "")
         item_evidence = [
             str(row)
             for row in evidence
             if _debt_evidence_status(row, item_id)
         ]
+        if not item_evidence:
+            continue
+        if {_debt_evidence_status(row, item_id) for row in item_evidence} == {"OPEN", "VERIFIED"}:
+            raise RevisionDebtError(f"同一债务ID存在OPEN与VERIFIED证据冲突，拒绝落账：{item_id}")
+        item["last_reviewed_chapter"] = chapter_num
+        item["last_review_evidence"] = item_evidence
         verified_evidence = [
             row
             for row in item_evidence
             if _debt_evidence_status(row, item_id) == "VERIFIED"
         ]
-        opened_chapter = int(item.get("opened_chapter") or 0)
         if (
             debt_status == "RESOLVED"
             and chapter_num >= opened_chapter
@@ -1040,12 +1078,12 @@ def update_revision_debt(path, chapter_num, result, horizon=10):
         ):
             item["status"] = "VERIFIED"
             item["closed_chapter"] = chapter_num
-            item["last_review_evidence"] = verified_evidence[:8]
+            item["last_review_evidence"] = verified_evidence
 
     open_by_action = {
         _normalize_action(item.get("action")): item
         for item in items
-        if item.get("status") == "OPEN"
+        if item.get("status") == "OPEN" and int(item.get("opened_chapter") or 0) <= chapter_num
     }
     for action in result.get("next_actions") or []:
         action = str(action or "").strip()
@@ -1064,6 +1102,7 @@ def update_revision_debt(path, chapter_num, result, horizon=10):
                 item
                 for item in items
                 if item.get("status") == "OPEN"
+                and int(item.get("opened_chapter") or 0) <= chapter_num
                 and _actions_semantically_duplicate(item.get("action"), action)
             ),
             None,
@@ -1102,7 +1141,7 @@ def update_revision_debt(path, chapter_num, result, horizon=10):
             result, hard_gate=bool(result.get("hard_gate"))
         ),
         "debt_status": debt_status,
-        "evidence": evidence[:8],
+        "evidence": evidence,
         "reviewed_chapters": result.get("reviewed_chapters") or [],
         "report_path": result.get("report_path", ""),
     }
@@ -1127,25 +1166,71 @@ def update_revision_debt(path, chapter_num, result, horizon=10):
     return data
 
 
-def render_revision_debt(data, current_chapter=0, max_chars=2600):
-    open_items = [item for item in (data or {}).get("items", []) if item.get("status") == "OPEN"]
+def select_revision_debt_context(data, current_chapter=0, max_chars=2600):
+    """Select complete priority-ordered debt blocks with an explicit budget.
+
+    Selection is context only: it never changes debt status or verifies prose.
+    A footer identifies every omitted ID; if even that cannot fit, fail before
+    a model call rather than silently pretending the context is complete.
+    """
+    if type(max_chars) is not int or not 1 <= max_chars <= 128000:
+        raise RevisionDebtError("修订债务上下文预算必须是1—128000的整数字符数")
+    open_items = [item for item in (data or {}).get("items", []) if item.get("status") == "OPEN"
+                  and (not current_chapter or int(item.get("opened_chapter") or 0) <= current_chapter)]
     if not open_items:
-        return ""
+        return {"text": "", "max_chars": max_chars, "eligible_count": 0,
+                "selected_count": 0, "selected_ids": [], "omitted_ids": [],
+                "full_coverage": True, "source_sha256": ""}
     open_items.sort(key=lambda item: (int(item.get("due_by") or 10**9), int(item.get("opened_chapter") or 0)))
-    lines = [
+    ids = [str(item["id"]) for item in open_items]
+    source = [{key: item.get(key) for key in ("id", "opened_chapter", "due_by", "action")}
+              for item in open_items]
+    digest = hashlib.sha256(json.dumps(source, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":")).encode("utf-8")).hexdigest()
+    heading = "\n".join([
         "# 未结阶段修订债务",
         "这些不是建议，而是下一次阶段商业审稿必须核销的执行项。不得靠一句说明假装完成。",
-    ]
-    for item in open_items[:12]:
+        "账本复核点由审稿horizon生成，不是原行动的延期许可；行动原文的章号窗口仍需单独核对。",
+        f"债务来源SHA256：{digest}",
+    ])
+    blocks = []
+    # Prefix costs and ID costs keep selection linear even for many debts.
+    block_costs, id_costs = [0], [0]
+    for item, debt_id in zip(open_items, ids):
         due_by = int(item.get("due_by") or 0)
-        overdue = "｜已逾期" if current_chapter and due_by and current_chapter > due_by else ""
-        not_due = "｜未到期" if current_chapter and due_by and current_chapter < due_by else ""
-        lines.append(
-            f"- {item.get('id')}｜第{item.get('opened_chapter')}章提出｜最迟第{item.get('due_by')}章："
+        overdue = "｜复核点已过" if current_chapter and due_by and current_chapter > due_by else ""
+        not_due = "｜未到复核点" if current_chapter and due_by and current_chapter < due_by else ""
+        blocks.append(
+            f"- {item.get('id')}｜第{item.get('opened_chapter')}章提出｜复核点第{item.get('due_by')}章："
             f"{item.get('action')}{overdue}{not_due}"
         )
-    text = "\n".join(lines)
-    return text if len(text) <= max_chars else text[: max_chars - 16].rstrip() + "\n[修订债务已截断]"
+        block_costs.append(block_costs[-1] + 1 + len(blocks[-1]))
+        id_costs.append(id_costs[-1] + len(debt_id))
+    total = len(blocks)
+    for count in range(total, -1, -1):
+        omitted = total - count
+        coverage = f"完整纳入{count}/{total}项；未纳入{omitted}项；文字预算{max_chars}字符。"
+        footer_cost = 0
+        if omitted:
+            # Count separators without repeatedly joining the whole suffix.
+            footer_cost = (1 + len(f"[预算省略{omitted}项：；仍为OPEN，不得假称全量核销。]")
+                           + id_costs[-1] - id_costs[count] + omitted - 1)
+        used = len(heading) + 1 + len(coverage) + block_costs[count] + footer_cost
+        if used <= max_chars:
+            lines = [heading, coverage, *blocks[:count]]
+            if omitted:
+                lines.append(f"[预算省略{omitted}项：{','.join(ids[count:])}；仍为OPEN，不得假称全量核销。]")
+            text = "\n".join(lines)
+            assert len(text) == used
+            return {"text": text, "max_chars": max_chars, "eligible_count": total,
+                    "selected_count": count, "selected_ids": ids[:count],
+                    "omitted_ids": ids[count:], "full_coverage": not omitted,
+                    "source_sha256": digest}
+    raise RevisionDebtError("修订债务预算不足以保留来源、覆盖范围和全部遗漏ID；未截断，未发起模型")
+
+
+def render_revision_debt(data, current_chapter=0, max_chars=2600):
+    return select_revision_debt_context(data, current_chapter, max_chars)["text"]
 
 
 def run_review(

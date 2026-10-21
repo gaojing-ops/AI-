@@ -54,7 +54,7 @@ MODEL_PRESETS = {
         "base_url": "https://api.deepseek.com",
         "model_config_field": "model",
         "review_model_config_field": "review_model",
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "review_model": "deepseek-v4-pro",
     },
     "Codex GPT-5.6-sol": {
@@ -95,8 +95,7 @@ def resolve_preset_model(preset, config, review=False):
     field_key = "review_model_config_field" if review else "model_config_field"
     field = preset.get(field_key, default_key)
     configured = str((config or {}).get(field) or "").strip()
-    if preset.get("base_url") == "https://api.deepseek.com" and configured in LEGACY_DEEPSEEK_MODELS:
-        configured = ""
+    # Explicit saved choices are never silently migrated to a different model.
     return configured or preset[default_key]
 
 # ============================================================
@@ -119,6 +118,9 @@ import book_initializer
 import continuity_guard
 import state_ledger
 import state_repair
+import chapter_budget
+import prompt_budget
+import source_context
 import temporal_memory
 import chapter_commit
 import chapter_validator
@@ -224,6 +226,9 @@ class NovelGeneratorGUI:
     GENERATION_USER_CHAR_CAP = 14000
     GENERATION_MIN_SYSTEM_CHAR_CAP = 18000
     GENERATION_MIN_USER_CHAR_CAP = 5000
+    STATE_SYSTEM_CHAR_CAP = 45000
+    STATE_USER_CHAR_CAP = 120000
+    STATE_INPUT_TOKEN_BUDGET = 110000
     RAG_DOC_CHAR_LIMIT = 1500
 
     STORY_VOLUME_RANGES = [
@@ -1284,6 +1289,8 @@ class NovelGeneratorGUI:
             self.switch_project(folder)
 
     def _reset_project_scoped_caches(self):
+        self._durable_chapter_budget = None
+        self._chapter_budget_project = ""
         self._tool_rules_cache = None
         self._reveal_rules_cache = None
         self._deepseek_preflight_cache = {}
@@ -1484,13 +1491,15 @@ class NovelGeneratorGUI:
         return generator.get_runtime_api_key(self.config)
 
     def _has_saved_api_key(self):
+        if self.config.get("credential_store") == "windows_dpapi":
+            return bool(generator.local_credentials.load_key())
         saved = str(self.config.get("api_key") or "").strip()
         return bool(saved and saved != "YOUR_DEEPSEEK_API_KEY_HERE")
 
     def _global_config_payload(self):
         defaults = generator.default_config()
         for key in (
-            "api_key", "base_url", "model_provider", "codex_executable",
+            "api_key", "credential_store", "base_url", "model_provider", "codex_executable",
             "codex_timeout_seconds", "model", "review_model", "temperature",
             "max_tokens", "current_volume", "author_name",
         ):
@@ -1508,6 +1517,14 @@ class NovelGeneratorGUI:
             json.dumps(self._global_config_payload(), ensure_ascii=False, indent=2),
         )
         generator.config = dict(self._global_config_payload())
+
+    def _save_private_api_key(self, value="", *, clear=False):
+        if clear:
+            generator.local_credentials.clear_key()
+        else:
+            generator.local_credentials.save_key(value)
+        self.config["credential_store"] = "windows_dpapi"
+        self.config["api_key"] = "YOUR_DEEPSEEK_API_KEY_HERE"
 
     def _project_needs_setup(self):
         title = str(self.config.get("book_title") or "").strip()
@@ -1664,13 +1681,14 @@ class NovelGeneratorGUI:
         kwargs = {
             "api_key": api_key,
             "base_url": base_url,
-            "timeout": 120,
+            "timeout": self._chapter_request_timeout(120),
+            "max_retries": 0,
         }
         if getattr(self, "_deepseek_direct_mode", False):
             # Windows system proxy + Clash Fake-IP can produce a valid TCP
             # tunnel but abort TLS. Direct mode still uses the TUN interface,
             # while ignoring the broken explicit proxy discovered by httpx.
-            kwargs["http_client"] = httpx.Client(trust_env=False, timeout=120)
+            kwargs["http_client"] = httpx.Client(trust_env=False, timeout=kwargs["timeout"])
         return OpenAI(**kwargs)
 
     def get_model_name(self):
@@ -2037,6 +2055,8 @@ class NovelGeneratorGUI:
         stream=False,
         thinking_override=None,
     ):
+        if thinking_override is None and review:
+            thinking_override = getattr(self, "_state_review_thinking_override", None)
         if thinking_override is None:
             thinking = bool(
                 self.config.get(
@@ -2393,7 +2413,7 @@ class NovelGeneratorGUI:
         elif self._has_saved_api_key():
             deepseek_key_note = "本机已保存密钥；这里留空表示继续使用。"
         else:
-            deepseek_key_note = "尚未配置。密钥只保存在本机工具目录的 config.json。"
+            deepseek_key_note = "尚未配置。新密钥使用Windows当前用户加密，保存在源码目录外。"
         key_note_var = tk.StringVar()
 
         def refresh_provider_note(*_args):
@@ -2480,12 +2500,12 @@ class NovelGeneratorGUI:
 
             new_key = api_entry.get().strip()
             if clear_key_var.get():
-                self.config["api_key"] = "YOUR_DEEPSEEK_API_KEY_HERE"
+                self._save_private_api_key(clear=True)
             elif new_key:
                 if new_key == "YOUR_DEEPSEEK_API_KEY_HERE":
                     messagebox.showerror("密钥无效", "请填写真实的 DeepSeek API Key。", parent=win)
                     return
-                self.config["api_key"] = new_key
+                self._save_private_api_key(new_key)
             self.config["model_provider"] = selected_provider
             self._active_preset_name = PROVIDER_PRESET_NAMES[selected_provider]
             self._persist_global_config()
@@ -2553,7 +2573,7 @@ class NovelGeneratorGUI:
         ttk.Label(win, text="DeepSeek API Key:", font=("微软雅黑", 10)).pack(anchor=tk.W, padx=15, pady=(15, 3))
         api_entry = ttk.Entry(win, width=60, show="*")
         api_entry.pack(padx=15, fill=tk.X)
-        api_entry.insert(0, self.config.get("api_key", ""))
+        api_entry.insert(0, "")  # Never populate a UI text field with a saved secret.
         ttk.Label(
             win,
             text="可优先设置系统环境变量 DEEPSEEK_API_KEY；手动保存时密钥会写入本机 config.json。",
@@ -2569,7 +2589,7 @@ class NovelGeneratorGUI:
         ttk.Label(win, text="正文生成模型:", font=("微软雅黑", 10)).pack(anchor=tk.W, padx=15, pady=(10, 3))
         model_entry = ttk.Entry(win, width=60)
         model_entry.pack(padx=15, fill=tk.X)
-        model_entry.insert(0, self.config.get("model", "deepseek-v4-flash"))
+        model_entry.insert(0, self.config.get("model", "deepseek-flash"))
 
         ttk.Label(win, text="质检/阶段审稿模型:", font=("微软雅黑", 10)).pack(anchor=tk.W, padx=15, pady=(10, 3))
         review_model_entry = ttk.Entry(win, width=60)
@@ -2590,7 +2610,7 @@ class NovelGeneratorGUI:
         ).pack(anchor=tk.W, padx=15, pady=(12, 2))
 
         def test_connection():
-            api_key = api_entry.get().strip()
+            api_key = api_entry.get().strip() or self._get_runtime_api_key()
             if not api_key or api_key == "YOUR_DEEPSEEK_API_KEY_HERE":
                 connection_status.set("测试失败：请先填写有效 API Key")
                 return
@@ -2637,7 +2657,7 @@ class NovelGeneratorGUI:
             # Fix Bug5+自审: 空值不覆盖已有 Key
             new_api_key = api_entry.get().strip()
             if new_api_key:
-                self.config["api_key"] = new_api_key
+                self._save_private_api_key(new_api_key)
             self.config["base_url"] = url_entry.get().strip()
             self.config["model"] = model_entry.get().strip()
             self.config["review_model"] = review_model_entry.get().strip()
@@ -2645,14 +2665,7 @@ class NovelGeneratorGUI:
                 self.config["temperature"] = float(temp_entry.get().strip())
             except Exception:
                 self.config["temperature"] = 0.8
-            # Fix Bug5: 使用 _exe_dir 而非 __file__
-            config_path = os.path.join(_exe_dir, "config.json")
-            _atomic_write_text(
-                config_path,
-                json.dumps(self.config, ensure_ascii=False, indent=2),
-            )
-            # 同步 generator.config
-            generator.config = self.config
+            self._persist_global_config()
             messagebox.showinfo("成功", "设置已保存！")
             win.destroy()
 
@@ -2831,26 +2844,60 @@ class NovelGeneratorGUI:
         )
 
     def _commercial_contract_context(self, max_chars=7000):
-        parts = []
-        # Active correction debt comes first so a long blueprint cannot push
-        # it past the prompt budget.
-        if self.config.get("revision_debt_enabled", True):
-            debt_path = os.path.join(generator.DIRS["plot"], "revision_debt.json")
-            debt_context = commercial_reviewer.render_revision_debt(
-                commercial_reviewer.load_revision_debt(debt_path),
-                current_chapter=int(getattr(self, "latest_chap", 0) or 0),
-                max_chars=2600,
-            )
-            if debt_context:
-                parts.append(debt_context)
-        action_path = os.path.join(generator.DIRS["plot"], "商业审稿行动单.md")
-        action_text = generator.read_text_safe(action_path).strip()
-        if action_text:
-            parts.append("# 最近阶段审稿行动单\n" + action_text[:2600])
-        blueprint = self._load_commercial_blueprint()
-        if blueprint:
-            parts.append(commercial_planner.render_blueprint(blueprint, max_chars=max_chars))
-        return "\n\n".join(parts)[:max_chars]
+        self._last_commercial_context_selection = {"status": "BUILDING", "max_chars": max_chars}
+
+        def record(metadata):
+            self._last_commercial_context_selection = metadata
+            append_audit = getattr(self, "_append_batch_audit", None)
+            if callable(append_audit):
+                try:
+                    append_audit({"event": "commercial_source_budget", **metadata})
+                except Exception:
+                    pass
+
+        try:
+            sources = []
+            debt_selection = None
+            if self.config.get("revision_debt_enabled", True):
+                debt_path = os.path.join(generator.DIRS["plot"], "revision_debt.json")
+                debt_selection = commercial_reviewer.select_revision_debt_context(
+                    commercial_reviewer.load_revision_debt(debt_path),
+                    current_chapter=int(getattr(self, "latest_chap", 0) or 0),
+                    max_chars=max_chars,
+                )
+                debt_metadata = {key: value for key, value in debt_selection.items() if key != "text"}
+                if not debt_selection["full_coverage"]:
+                    raise source_context.SourceBudgetError(
+                        "开放债务未能全部纳入商业上下文；未发模型，未自动扩预算",
+                        {"status": "BLOCKED", "max_chars": max_chars, "used_chars": 0,
+                         "full_coverage": False, "debt_selection": debt_metadata})
+                if debt_selection["text"]:
+                    sources.append({"label": "修订债务", "text": debt_selection["text"],
+                                    "category": "revision_debt", "required": True})
+            action_path = os.path.join(generator.DIRS["plot"], "商业审稿行动单.md")
+            action_text = generator.read_text_safe(action_path).strip()
+            action_heading = re.match(r"^#\s*第\s*(\d+)\s*章后商业行动单(?:\s|$)", action_text)
+            # Rewound prefixes must not inherit a future-stage action board.
+            action_is_future = bool(action_heading and int(action_heading[1]) > int(getattr(self, "latest_chap", 0) or 0))
+            if action_text:
+                sources.append({"label": "最近阶段审稿行动单", "text": action_text,
+                                "category": "commercial_action", "required": not action_is_future,
+                                "eligible": not action_is_future, "reason": "future_action_board"})
+            blueprint = self._load_commercial_blueprint()
+            if blueprint:
+                sources.append({"label": "商业立项执行合同",
+                                "text": commercial_planner.render_blueprint(blueprint, max_chars=None),
+                                "category": "commercial_blueprint", "required": True})
+            selected = source_context.select_whole_sources(sources, max_chars)
+            metadata = selected["metadata"]
+            if debt_selection is not None:
+                metadata["debt_selection"] = debt_metadata
+        except (source_context.SourceBudgetError, commercial_reviewer.RevisionDebtError, ValueError) as exc:
+            record(getattr(exc, "metadata", {"status": "BLOCKED", "max_chars": max_chars,
+                                             "used_chars": 0, "full_coverage": False}))
+            raise
+        record(metadata)
+        return selected["text"]
 
     def _ensure_commercial_blueprint(self, title, genre, total):
         """Automatically create and enforce the pre-writing commercial gate."""
@@ -2954,7 +3001,7 @@ class NovelGeneratorGUI:
         )
         _atomic_write_text(
             os.path.join(generator.DIRS["plot"], "商业立项执行合同.md"),
-            commercial_planner.render_blueprint(best) + "\n",
+            commercial_planner.render_blueprint(best, max_chars=None) + "\n",
         )
         if final_issues:
             raise RuntimeError(
@@ -3596,57 +3643,35 @@ class NovelGeneratorGUI:
         return pattern.sub(repl, prompt_text, count=1)
 
     def _apply_generation_prompt_budget(self, system_prompt, user_prompt):
-        original_stats = {
-            "system_chars": len(system_prompt),
-            "user_chars": len(user_prompt),
-        }
-        original_stats["input_tokens"] = (
-            self._estimate_token_count(system_prompt)
-            + self._estimate_token_count(user_prompt)
-            + 64
+        # These assembled strings contain canon, outlines, permissions and
+        # candidate prose. Tags inside data cannot grant permission to drop it.
+        return self._assemble_prompt_budget(
+            [prompt_budget.Block("generation_rules_and_canon", system_prompt, "system"),
+             prompt_budget.Block("chapter_task_and_evidence", user_prompt)],
+            stage="generation", system_cap=self.GENERATION_SYSTEM_CHAR_CAP,
+            user_cap=self.GENERATION_USER_CHAR_CAP, token_budget=self.GENERATION_INPUT_TOKEN_BUDGET,
         )
 
-        system_prompt = self._truncate_tag_block(system_prompt, "source_of_truth", 9000)
-        system_prompt = self._truncate_tag_block(system_prompt, "plot_and_memo", 7000)
-        system_prompt = self._truncate_tag_block(system_prompt, "world_building_rules", 5000)
-        system_prompt = self._truncate_tag_block(system_prompt, "character_profiles", 4000)
-        system_prompt = self._truncate_tag_block(system_prompt, "tone_rules", 1800)
-        system_prompt = self._truncate_tag_block(system_prompt, "reveal_budget", 2500)
+    def _assemble_prompt_budget(self, blocks, *, stage, system_cap, user_cap, token_budget):
+        try:
+            result = prompt_budget.assemble(
+                blocks, estimate_tokens=self._estimate_token_count, system_cap=system_cap,
+                user_cap=user_cap, token_budget=token_budget,
+            )
+        except prompt_budget.PromptBudgetError as exc:
+            self._record_prompt_budget(stage, exc.report)
+            raise
+        self._record_prompt_budget(stage, result[2])
+        return result
 
-        if len(system_prompt) > self.GENERATION_SYSTEM_CHAR_CAP:
-            system_prompt = self._truncate_keep_ends(system_prompt, self.GENERATION_SYSTEM_CHAR_CAP)
-        if len(user_prompt) > self.GENERATION_USER_CHAR_CAP:
-            user_prompt = self._truncate_keep_ends(user_prompt, self.GENERATION_USER_CHAR_CAP)
-
-        est_tokens = self._estimate_token_count(system_prompt) + self._estimate_token_count(user_prompt) + 64
-        while est_tokens > self.GENERATION_INPUT_TOKEN_BUDGET:
-            changed = False
-            if len(system_prompt) > self.GENERATION_MIN_SYSTEM_CHAR_CAP:
-                next_cap = max(self.GENERATION_MIN_SYSTEM_CHAR_CAP, len(system_prompt) - 4000)
-                new_system = self._truncate_keep_ends(system_prompt, next_cap)
-                if len(new_system) < len(system_prompt):
-                    system_prompt = new_system
-                    changed = True
-            if est_tokens > self.GENERATION_INPUT_TOKEN_BUDGET and len(user_prompt) > self.GENERATION_MIN_USER_CHAR_CAP:
-                next_cap = max(self.GENERATION_MIN_USER_CHAR_CAP, len(user_prompt) - 1500)
-                new_user = self._truncate_keep_ends(user_prompt, next_cap)
-                if len(new_user) < len(user_prompt):
-                    user_prompt = new_user
-                    changed = True
-            if not changed:
-                break
-            est_tokens = self._estimate_token_count(system_prompt) + self._estimate_token_count(user_prompt) + 64
-
-        final_stats = {
-            "system_chars": len(system_prompt),
-            "user_chars": len(user_prompt),
-            "input_tokens": est_tokens,
-        }
-        return system_prompt, user_prompt, {
-            "trimmed": final_stats != original_stats,
-            "original": original_stats,
-            "final": final_stats,
-        }
+    def _record_prompt_budget(self, stage, report):
+        self._last_prompt_budget = {"stage": stage, **report}
+        # Diagnostic storage is best-effort, just like the existing audit sink;
+        # it is not an approval receipt and contains no prompt text.
+        try:
+            self._append_batch_audit({"event": "prompt_budget", **self._last_prompt_budget})
+        except Exception:
+            pass
 
     def build_system_prompt_gui(self, current_prompt=""):
         prompt_parts = []
@@ -3692,7 +3717,7 @@ class NovelGeneratorGUI:
         if publishing_context:
             prompt_parts.append(
                 "<publishing_and_theme_rules>\n"
-                + publishing_context[:5200]
+                + publishing_context
                 + "</publishing_and_theme_rules>\n"
             )
 
@@ -3723,10 +3748,7 @@ class NovelGeneratorGUI:
             if content:
                 # 所有 plot 文件都过 reveal 过滤
                 content = self._filter_spoilers_from_text(content, self.next_chap)
-                # 截断防 token 爆炸
-                if len(content) > 3000:
-                    content = content[:3000] + "\n[...已截断...]"
-                selected_plot.append(f"【{name}】\n{content}")
+                selected_plot.append(self._whole_context_source(name, content, "selected_plot"))
         if selected_plot:
             prompt_parts.append("<plot_and_memo>\n" + "\n\n".join(selected_plot) + "\n</plot_and_memo>\n")
 
@@ -3769,18 +3791,22 @@ class NovelGeneratorGUI:
         for res in results:
             doc_id, score, title, content = res
             if doc_id.startswith("char_"):
-                selected_chars.append(f"【{title}】\n{self._truncate_keep_ends(content, self.RAG_DOC_CHAR_LIMIT)}")
+                selected_chars.append(self._whole_context_source(title, content, "rag_character"))
             else:
-                selected_world.append(f"【{title}】\n{self._truncate_keep_ends(content, self.RAG_DOC_CHAR_LIMIT)}")
+                selected_world.append(self._whole_context_source(title, content, "rag_world"))
         if not results:
+            fallback_chars = [name for name in self.chars_vars if name in selected_char_names][:3]
+            fallback_world = [name for name in self.world_vars if name in selected_world_names][:4]
             selected_chars = [
-                f"【{name}】\n{self._truncate_keep_ends(generator.read_text_safe(self.chars_map[name]), self.RAG_DOC_CHAR_LIMIT)}"
-                for name, var in self.chars_vars.items() if var.get()
-            ][:3]
+                self._whole_context_source(name, self._filter_spoilers_from_text(
+                    generator.read_text_safe(self.chars_map[name]), self.next_chap), "fallback_character")
+                for name in fallback_chars
+            ]
             selected_world = [
-                f"【{name}】\n{self._truncate_keep_ends(generator.read_text_safe(self.world_map[name]), self.RAG_DOC_CHAR_LIMIT)}"
-                for name, var in self.world_vars.items() if var.get()
-            ][:4]
+                self._whole_context_source(name, self._filter_spoilers_from_text(
+                    generator.read_text_safe(self.world_map[name]), self.next_chap), "fallback_world")
+                for name in fallback_world
+            ]
 
         if selected_chars:
             prompt_parts.append("<character_profiles>\n" + "\n\n".join(selected_chars) + "\n</character_profiles>\n")
@@ -3812,6 +3838,14 @@ class NovelGeneratorGUI:
         )
         return "\n".join(prompt_parts)
 
+    def _whole_context_source(self, label, text, category):
+        block, metadata = source_context.whole_source(label, text, category)
+        try:
+            self._append_batch_audit({"event": "source_selection", **metadata})
+        except Exception:
+            pass
+        return block
+
     def _load_source_of_truth_context(self):
         plot_dir = generator.DIRS["plot"]
         preferred_files = [
@@ -3819,8 +3853,8 @@ class NovelGeneratorGUI:
             "全局备忘录.txt",
             "伏笔与因果追踪表.txt",
         ]
-        stage_truth = story_architect.build_stage_truth_context(plot_dir, self.next_chap, max_chars=2800)
-        stage_story = story_architect.build_story_context(plot_dir, self.next_chap, max_chars=2400)
+        stage_truth = story_architect.build_stage_truth_context(plot_dir, self.next_chap, max_chars=None)
+        stage_story = story_architect.build_story_context(plot_dir, self.next_chap, max_chars=None)
         chunks = [part for part in (stage_truth, stage_story) if part]
         added = set()
 
@@ -3831,7 +3865,7 @@ class NovelGeneratorGUI:
                 if content:
                     added.add(os.path.normcase(fpath))
                     content = self._filter_spoilers_from_text(content, self.next_chap)
-                    chunks.append(f"【{fname}】\n{content[:2500]}")
+                    chunks.append(self._whole_context_source(fname, content, "truth_anchor"))
 
         # 不再自动拼入全部细纲候选。当前章细纲已在 batch_worker 里
         # 作为 outline_block 强制注入 user_prompt，source_of_truth 只保留
@@ -4130,6 +4164,8 @@ class NovelGeneratorGUI:
         }
         extra_parts.append(
             "【审核裁决边界（必须服从）】\n"
+            "- 一次列齐有证据的硬问题；纯文风偏好、措辞建议只能WARN，不能升级FAIL。"
+            "保留明确事实矛盾、核心事件缺失及项目显式硬规则的FAIL。\n"
             f"- 程序实测中文字符数为 {chinese_chars}，项目硬下限为 {char_limits['min']}；"
             "已达到硬下限且完成核心事件时，不得仅因节奏或心理描写偏多判定‘内容空洞’。\n"
             "- 截止时间、上级要求提交结论、舆论与职业责任均属于外部压力；"
@@ -4153,7 +4189,9 @@ class NovelGeneratorGUI:
         )
         commercial_context = self._commercial_contract_context(max_chars=5200)
         if policy_context:
-            extra_parts.append(f"【发布与题材规则】\n{policy_context[:5000]}")
+            extra_parts.append(self._whole_context_source(
+                "发布与题材规则", policy_context, "publishing_rules"
+            ))
         if chapter_outline:
             extra_parts.append(f"【本章细纲】\n{chapter_outline}")
         if prev_content:
@@ -4173,15 +4211,15 @@ class NovelGeneratorGUI:
         plot_dir = generator.DIRS.get("plot", "")
         if plot_dir:
             fact_context = knowledge_manager.build_generation_context(
-                plot_dir, review_chapter, max_chars=2600
+                plot_dir, review_chapter, max_chars=None
             )
             if fact_context:
                 extra_parts.append(f"【关键事实库】\n{fact_context}")
-            canon_context = continuity_guard.build_canon_context(plot_dir, max_chars=2200)
+            canon_context = continuity_guard.build_canon_context(plot_dir, max_chars=None)
             if canon_context:
                 extra_parts.append(canon_context)
             story_context = story_architect.build_story_context(
-                plot_dir, review_chapter, max_chars=1800
+                plot_dir, review_chapter, max_chars=None
             )
             if story_context:
                 extra_parts.append(story_context)
@@ -4195,11 +4233,20 @@ class NovelGeneratorGUI:
             if os.path.exists(main_char_path):
                 char_card = generator.read_text_safe(main_char_path)
                 if char_card:
-                    extra_parts.append(f"【角色卡】\n{char_card[:1000]}")
+                    extra_parts.append(self._whole_context_source(
+                        "角色卡", char_card, "review_character"
+                    ))
                     break
         extra_context = "\n\n".join(extra_parts)
 
         def llm_fn(sys_p, user_p, temp):
+            sys_p, user_p, _ = self._assemble_prompt_budget(
+                [prompt_budget.Block("quality_rules", sys_p, "system"),
+                 prompt_budget.Block("quality_task_and_evidence", user_p)],
+                stage="quality_review", system_cap=self.STATE_SYSTEM_CHAR_CAP,
+                user_cap=self.STATE_USER_CHAR_CAP,
+                token_budget=self.STATE_INPUT_TOKEN_BUDGET,
+            )
             return self.call_llm_review(sys_p, user_p, temp=temp, max_tokens=1200)
 
         result = skill_engine.execute_skill(
@@ -4451,9 +4498,9 @@ class NovelGeneratorGUI:
         if not volume_outline:
             volume_outline = generator.read_text_safe(os.path.join(plot_dir, "全书大纲.txt"))
         memo = generator.read_text_safe(os.path.join(plot_dir, "全局备忘录.txt"))
-        fact_context = knowledge_manager.build_generation_context(plot_dir, start_chap, max_chars=2400)
-        canon_context = continuity_guard.build_canon_context(plot_dir, max_chars=1800)
-        story_context = story_architect.build_story_context(plot_dir, start_chap, max_chars=2600)
+        fact_context = knowledge_manager.build_generation_context(plot_dir, start_chap, max_chars=None)
+        canon_context = continuity_guard.build_canon_context(plot_dir, max_chars=None)
+        story_context = story_architect.build_story_context(plot_dir, start_chap, max_chars=None)
         ledger_context = ""
         if self.config.get("structured_state_enabled", True):
             ledger_context, _ = state_ledger.render_context(
@@ -4541,7 +4588,7 @@ class NovelGeneratorGUI:
 {story_context if story_context else "暂无"}
 
 【番茄发布与项目题材规则】
-{policy_context[:4200] if policy_context else "暂无"}
+{policy_context if policy_context else "暂无"}
 
 【商业立项与最近审稿行动】
 {commercial_context if commercial_context else "暂无"}
@@ -4561,7 +4608,14 @@ class NovelGeneratorGUI:
                         + last_summary
                         + "\n请完整重写这一批细纲，不要只解释。"
                     )
-                outline_text = self.call_llm_non_stream(sys_prompt, prompt, temp=0.5, max_tokens=4200)
+                budget_system, budget_user, _ = self._assemble_prompt_budget(
+                    [prompt_budget.Block("outline_rules", sys_prompt, "system"),
+                     prompt_budget.Block("outline_task_and_evidence", prompt)],
+                    stage="rolling_outline", system_cap=self.STATE_SYSTEM_CHAR_CAP,
+                    user_cap=self.STATE_USER_CHAR_CAP,
+                    token_budget=self.STATE_INPUT_TOKEN_BUDGET,
+                )
+                outline_text = self.call_llm_non_stream(budget_system, budget_user, temp=0.5, max_tokens=4200)
                 outline_text = (outline_text or "").strip()
                 check = continuity_guard.validate_outline(
                     outline_text,
@@ -4582,7 +4636,7 @@ class NovelGeneratorGUI:
             })
             return ""
         except Exception as e:
-            if self._is_codex_fatal_transport_error(e):
+            if isinstance(e, prompt_budget.PromptBudgetError) or self._is_codex_fatal_transport_error(e):
                 raise
             self._ui_progress_append(f"    [FAIL] 滚动细纲生成失败: {str(e)[:80]}\n")
             return ""
@@ -4964,7 +5018,8 @@ class NovelGeneratorGUI:
         else:
             normalized = deepseek_runtime.normalize_usage(usage)
             estimated_cost = deepseek_runtime.estimate_cost_cny(model, normalized)
-            pricing_note = "按工具内置单价估算；最终扣费以 DeepSeek 账户账单为准"
+            pricing_note = ("2026-09-29官方高峰价保守估算（空闲实际可减半）；"
+                            "未重算历史费用，最终以DeepSeek账单为准")
         if not normalized.get("total_tokens") and provider != PROVIDER_CODEX_SOL:
             return
         with self._model_call_lock:
@@ -5109,7 +5164,7 @@ class NovelGeneratorGUI:
                 )
         with self._model_call_lock:
             if self._model_call_limit and self._model_call_count >= self._model_call_limit:
-                raise RuntimeError(
+                raise chapter_budget.BudgetStopped(
                     f"本次模型调用已达到硬上限 {self._model_call_limit} 次，已停止继续调用"
                 )
             chapter_limit = getattr(self, "_chapter_model_call_limit", 0)
@@ -5140,7 +5195,7 @@ class NovelGeneratorGUI:
                 and not ledger_call
                 and not commercial_call
             ):
-                attempts = max(1, int(self.config.get("state_delta_max_attempts", 2) or 2))
+                attempts = chapter_budget.bounded_attempts(self.config.get("state_delta_max_attempts", 2))
                 audit_enabled = bool(
                     self.config.get("state_delta_independent_audit", True)
                     or self.config.get("pre_save_continuity_audit_enabled", True)
@@ -5148,17 +5203,22 @@ class NovelGeneratorGUI:
                 calls_per_attempt = 2 if audit_enabled else 1
                 ledger_reserve = min(max(0, chapter_limit - 4), attempts * calls_per_attempt)
             effective_limit = chapter_limit if ledger_call else chapter_limit - ledger_reserve
-            if chapter_limit and not commercial_call and chapter_count >= effective_limit:
+            if chapter_limit and (chapter_count >= chapter_limit or
+                                  (not commercial_call and chapter_count >= effective_limit)):
                 if ledger_reserve:
-                    raise RuntimeError(
+                    raise chapter_budget.BudgetStopped(
                         f"第 {chapter_number} 章普通调用已达到 {effective_limit} 次；"
                         f"单章硬上限 {chapter_limit} 次中已为正史证据记账预留 {ledger_reserve} 次，"
                         "已停止普通调用，避免正文保存后没有额度更新长期记忆"
                     )
-                raise RuntimeError(
+                raise chapter_budget.BudgetStopped(
                     f"第 {chapter_number} 章模型调用已达到单章硬上限 {chapter_limit} 次，"
                     "已停止继续调用"
                 )
+            budget = getattr(self, "_durable_chapter_budget", None)
+            if budget is not None:
+                row = budget.transact("call")
+                chapter_count = row["calls"] - 1
             self._model_call_count += 1
             if chapter_limit:
                 self._chapter_model_call_count = chapter_count + 1
@@ -5183,11 +5243,30 @@ class NovelGeneratorGUI:
             4,
             min(20, int(self.config.get("max_model_calls_per_chapter", 16) or 16)),
         )
+        project = getattr(self, "_chapter_budget_project", "") or getattr(self, "project_dir", "")
+        budget = chapter_budget.ChapterBudget(
+            project, chap_num, per_chapter,
+            self.config.get("max_chapter_elapsed_seconds", 1200),
+        ) if project else None
+        row = budget.transact() if budget is not None else None
         with self._model_call_lock:
+            same_chapter = getattr(self, "_chapter_model_call_number", 0) == int(chap_num)
+            self._durable_chapter_budget = budget
             self._chapter_model_call_number = int(chap_num)
-            self._chapter_model_call_count = 0
-            self._chapter_model_call_limit = per_chapter
+            self._chapter_model_call_count = row["calls"] if row else (
+                getattr(self, "_chapter_model_call_count", 0) if same_chapter else 0
+            )
+            self._chapter_model_call_limit = row["call_limit"] if row else per_chapter
         self._ui(self._update_model_usage_label)
+
+    def _chapter_request_timeout(self, maximum):
+        budget = getattr(self, "_durable_chapter_budget", None)
+        return budget.remaining(maximum) if budget is not None else maximum
+
+    def _claim_chapter_repair(self):
+        budget = getattr(self, "_durable_chapter_budget", None)
+        if budget is not None:
+            budget.transact("repair")
 
     def disable_buttons(self):
         self._set_busy_widgets(True)
@@ -5244,9 +5323,9 @@ class NovelGeneratorGUI:
             user_prompt,
             executable=executable,
             evidence_dir=self._codex_evidence_dir(safe_task),
-            timeout_seconds=max(
+            timeout_seconds=self._chapter_request_timeout(max(
                 30, int(self.config.get("codex_timeout_seconds", 900) or 900)
-            ),
+            )),
             max_output_chars=max(512, int(token_limit or 8192) * 4),
             task_type=safe_task,
         )
@@ -5275,6 +5354,7 @@ class NovelGeneratorGUI:
             provider=PROVIDER_CODEX_SOL,
             evidence=result,
         )
+        self._chapter_request_timeout(120)
         return content
 
     def _call_generation_text(
@@ -5318,16 +5398,24 @@ class NovelGeneratorGUI:
         ))
         content = ""
         stream_usage = None
-        for chunk in stream:
-            if getattr(chunk, "usage", None):
-                stream_usage = chunk.usage
-            if self._stop_event.is_set():
-                break
-            if chunk.choices and chunk.choices[0].delta.content:
-                text_chunk = chunk.choices[0].delta.content
-                content += text_chunk
-                if on_chunk is not None:
-                    on_chunk(text_chunk)
+        try:
+            for chunk in stream:
+                budget = getattr(self, "_durable_chapter_budget", None)
+                if budget is not None:
+                    budget.check_stream()
+                if getattr(chunk, "usage", None):
+                    stream_usage = chunk.usage
+                if self._stop_event.is_set():
+                    break
+                if chunk.choices and chunk.choices[0].delta.content:
+                    text_chunk = chunk.choices[0].delta.content
+                    content += text_chunk
+                    if on_chunk is not None:
+                        on_chunk(text_chunk)
+        finally:
+            close_stream = getattr(stream, "close", None)
+            if callable(close_stream):
+                close_stream()
         self._record_model_usage(
             stream_usage,
             model_name,
@@ -5342,6 +5430,9 @@ class NovelGeneratorGUI:
         self._ui_clear(" 正在燃烧算力生成中，请稍候...\n\n")
 
         try:
+            chapter = getattr(self, "next_chap" if is_new else "latest_chap", 0)
+            if chapter:
+                self._begin_chapter_model_budget(chapter)
             system_prompt, final_user_prompt, prompt_stats = self._apply_generation_prompt_budget(
                 system_prompt, final_user_prompt
             )
@@ -5468,7 +5559,7 @@ class NovelGeneratorGUI:
             review=review,
             stream=False,
         )
-        response = client.chat.completions.create(**request_kwargs)
+        response = client.chat.completions.create(timeout=self._chapter_request_timeout(120), **request_kwargs)
         actual_thinking = (
             request_kwargs.get("extra_body", {})
             .get("thinking", {})
@@ -5481,6 +5572,8 @@ class NovelGeneratorGUI:
             task_type,
             provider=PROVIDER_DEEPSEEK,
         )
+
+        self._chapter_request_timeout(120)
 
         def _response_content(payload):
             choices = getattr(payload, "choices", None) or []
@@ -5525,7 +5618,7 @@ class NovelGeneratorGUI:
                 stream=False,
                 thinking_override=False,
             )
-            response = client.chat.completions.create(**fallback_kwargs)
+            response = client.chat.completions.create(timeout=self._chapter_request_timeout(120), **fallback_kwargs)
             self._record_model_usage(
                 getattr(response, "usage", None),
                 selected_model,
@@ -5533,6 +5626,7 @@ class NovelGeneratorGUI:
                 f"{task_type}_thinking_fallback",
                 provider=PROVIDER_DEEPSEEK,
             )
+            self._chapter_request_timeout(120)
             content = _response_content(response)
         return self.strip_markdown_artifacts(content)
 
@@ -5607,6 +5701,37 @@ class NovelGeneratorGUI:
         })
         return manifest
 
+    def _collect_local_review(self, content, chapter, limits, titles):
+        """One deterministic issue packet; no model and no early rewrite."""
+        report = chapter_validator.validate_candidate(
+            self.project_dir or os.path.dirname(generator.DIRS["plot"]), chapter, content, limits,
+        )
+        issues, warnings = [], []
+        for item in report.get("issues") or []:
+            message = str(item.get("message") or item.get("code") or "未知验收问题")
+            (issues if item.get("blocking", True) else warnings).append(message)
+        if not report.get("passed") and not issues:
+            issues.append("正文验收未返回通过证据")
+        issues.extend(self._detect_chapter_repetition(content, chapter))
+        count = sum(content.count(word) for word in ("像是", "仿佛", "似乎"))
+        if count > 4:
+            issues.append(f"反AI腔项目硬规则：模糊类比{count}次，上限4次")
+        drift = self._check_content_drift(content, chap_num=chapter)
+        if drift:
+            issues.append(f"漂移防火墙命中禁词/格式残留：{drift}")
+        title = re.sub(r'^第\d+章\s*', '', content.strip().split('\n')[0].lstrip('#').strip())
+        if title and title in titles:
+            issues.append(f"标题重复：{title}")
+        semantic = self._run_semantic_consistency_guard(content, chapter)
+        if not semantic.get("passed"):
+            issues.append("语义一致性硬门：" + self._semantic_guard_message(semantic))
+        if self.config.get("canon_guard_enabled", True):
+            canon = continuity_guard.validate_chapter(content, chapter, generator.DIRS["plot"])
+            if canon.get("status") == "FAIL":
+                issues.append("正史连续性：" + str(canon.get("summary") or "未通过"))
+        return {"candidate_report": report, "issues": list(dict.fromkeys(issues)),
+                "warnings": list(dict.fromkeys(warnings)), "blocked": report.get("status") == "blocked"}
+
     def _run_semantic_consistency_guard(self, chapter_content, chap_num):
         """Run project invariants against every official chapter plus candidate."""
         rows = []
@@ -5670,10 +5795,10 @@ class NovelGeneratorGUI:
                 plot_dir, chap_num, max_chars=4500
             ),
             canon_context=continuity_guard.build_canon_context(
-                plot_dir, max_chars=4500
+                plot_dir, max_chars=None
             ),
             recent_context=knowledge_manager.build_generation_context(
-                plot_dir, chap_num, max_chars=2600, include_sources=False
+                plot_dir, chap_num, max_chars=None, include_sources=False
             ),
         )
         if not requirements:
@@ -5705,6 +5830,13 @@ class NovelGeneratorGUI:
                 + json.dumps(trigger_positions, ensure_ascii=False)
                 + "\n若细纲要求关键触发点位于某百分比之前，必须以上述中文字符计数裁决。"
             )
+        system_prompt, user_prompt, _ = self._assemble_prompt_budget(
+            [prompt_budget.Block("narrative_rules", system_prompt, "system"),
+             prompt_budget.Block("narrative_task_and_evidence", user_prompt)],
+            stage="narrative_review", system_cap=self.STATE_SYSTEM_CHAR_CAP,
+            user_cap=self.STATE_USER_CHAR_CAP,
+            token_budget=self.STATE_INPUT_TOKEN_BUDGET,
+        )
         review_user_prompt = user_prompt
         raw = self.call_llm_review(
             system_prompt,
@@ -5760,11 +5892,18 @@ class NovelGeneratorGUI:
                 + "每个 draft_quote 和 progress_evidence_quote 必须从正文逐字复制一段连续原句，"
                 + "不得复制细纲、不得概括、不得用省略号拼接不连续句子。"
                 + "若证据不存在，保留 FAIL 并给出可定位的真实缺口。只输出完整 JSON。\n"
-                + f"【上轮 JSON】\n{json.dumps(payload, ensure_ascii=False)[:7000]}\n"
+                + f"【上轮 JSON】\n{json.dumps(payload, ensure_ascii=False)}\n"
                 + f"【上轮程序校验问题】\n{'；'.join(issues[:12])}"
             )
+            correction_system, correction_prompt, _ = self._assemble_prompt_budget(
+                [prompt_budget.Block("narrative_rules", system_prompt, "system"),
+                 prompt_budget.Block("narrative_correction_and_evidence", correction_prompt)],
+                stage="narrative_readjudication", system_cap=self.STATE_SYSTEM_CHAR_CAP,
+                user_cap=self.STATE_USER_CHAR_CAP,
+                token_budget=self.STATE_INPUT_TOKEN_BUDGET,
+            )
             corrected_raw = self.call_llm_review(
-                system_prompt,
+                correction_system,
                 correction_prompt,
                 temp=0.0,
                 max_tokens=2600,
@@ -5862,18 +6001,46 @@ class NovelGeneratorGUI:
             min_score=int(self.config.get("narrative_guard_min_score", 75) or 75),
         )
 
-    def _call_state_review(self, system_prompt, user_prompt, *, chapter, attempt, phase, temp):
+    def _call_state_review(self, system_prompt, user_prompt, *, chapter, attempt, phase, temp,
+                           repair_history=None):
         """Expose actual request boundaries; a heartbeat is not model progress."""
+        blocks = [prompt_budget.Block("state_rules", system_prompt, "system"),
+                  prompt_budget.Block("state_task_and_evidence", user_prompt)]
+        if repair_history:
+            available = max(0, self.STATE_USER_CHAR_CAP - len(user_prompt))
+            history = state_repair.history_context(repair_history, max_chars=min(16000, available))
+            blocks.append(prompt_budget.Block("repair_history", history, priority=2, required=False))
+        try:
+            system_prompt, user_prompt, _stats = self._assemble_prompt_budget(
+                blocks, stage="state_" + phase, system_cap=self.STATE_SYSTEM_CHAR_CAP,
+                user_cap=self.STATE_USER_CHAR_CAP, token_budget=self.STATE_INPUT_TOKEN_BUDGET,
+            )
+        except prompt_budget.PromptBudgetError as exc:
+            raise state_ledger.StateExtractionError(str(exc)) from exc
         started = time.monotonic()
         details = {"chapter": int(chapter), "stage": "structured_state",
                    "attempt": attempt, "phase": phase}
         self._formal_suffix_emit_progress("state_model_call_started", **details)
+        output_limit = state_ledger.state_review_output_limit(
+            phase, self.config.get("state_extraction_output_tokens", 8192))
+        before_completion = getattr(self, "_usage_completion_tokens", 0)
+        self._last_state_review_usage = {}
+        old_state_thinking = getattr(self, "_state_review_thinking_override", None)
+        self._state_review_thinking_override = (
+            bool(self.config.get("deepseek_state_extraction_thinking", False))
+            if phase == "状态提取" else None)
         try:
-            result = self.call_llm_review(system_prompt, user_prompt, temp=temp, max_tokens=3600)
+            result = self.call_llm_review(system_prompt, user_prompt, temp=temp, max_tokens=output_limit)
         except Exception:
             self._formal_suffix_emit_progress("state_model_call_failed", **details,
                                               elapsed_seconds=round(time.monotonic() - started, 1))
             raise
+        finally:
+            self._state_review_thinking_override = old_state_thinking
+        self._last_state_review_usage = {
+            "completion_tokens": max(0, getattr(self, "_usage_completion_tokens", 0) - before_completion),
+            "output_limit": output_limit,
+        }
         self._formal_suffix_emit_progress("state_model_call_completed", **details,
                                           elapsed_seconds=round(time.monotonic() - started, 1))
         return result
@@ -5886,6 +6053,9 @@ class NovelGeneratorGUI:
         state_override=None,
         repair_context=None,
         rejection_callback=None,
+        manual_patch_context=None,
+        pending_audit_context=None,
+        pending_audit_callback=None,
     ):
         """Prepare and audit a delta before the chapter is allowed to become official."""
         if not self.config.get("structured_state_enabled", True):
@@ -5932,7 +6102,7 @@ class NovelGeneratorGUI:
             prior_context,
             progression_context=continuity_guard.load_canon(plot_dir) or {},
         )
-        attempts = max(1, min(3, int(self.config.get("state_delta_max_attempts", 2) or 2)))
+        attempts = chapter_budget.bounded_attempts(self.config.get("state_delta_max_attempts", 2))
         verified_source_context = state_ledger.build_verified_prose_context(
             state, chap_num, self._official_chapter_paths_by_number()
         )
@@ -5963,11 +6133,42 @@ class NovelGeneratorGUI:
                 "chapter": int(chap_num),
                 "issue_count": len(last_issues),
             })
+        manual_proposed = None
+        try:
+            resumed_proposed = state_repair.restore_pending_audit(
+                pending_audit_context, chapter=chap_num, chapter_sha256=chapter_hash, state=state)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise state_ledger.StateExtractionError(str(exc)) from exc
+        if manual_patch_context is not None:
+            try:
+                manual_proposed = state_repair.manual_candidate(
+                    manual_patch_context, repair_context, chapter=chap_num,
+                    chapter_sha256=chapter_hash, state=state,
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                raise state_ledger.StateExtractionError(str(exc)) from exc
+            # A new, explicitly supplied manual patch may receive one audit;
+            # it does not clear old history or renew the automatic repair quota.
+            attempts = 1
+            last_issues = []
+        elif resumed_proposed is not None:
+            # One real audit only; retain rejection history and every budget.
+            attempts = 1
+            last_issues = []
+
+        def save_pending(payload):
+            if not callable(pending_audit_callback):
+                return
+            try:
+                pending_audit_callback(payload)
+            except Exception as exc:
+                self._state_repair_persistence_fault = "STATE_PENDING_AUDIT_STORAGE_FAILED：未审状态无法保存并回读；停止，不再发起模型"
+                raise state_ledger.StateExtractionError(self._state_repair_persistence_fault) from exc
         self._state_ledger_call_active = True
         try:
-            rejection_limit = self.config.get("state_repair_max_rejections", 6) or 6
+            rejection_limit = min(2, state_repair.rejection_limit(self.config.get("state_repair_max_rejections", 6)))
             stopped = state_repair.stop_reason(repair_history, rejection_limit)
-            if stopped:
+            if stopped and manual_proposed is None:
                 raise state_ledger.StateExtractionError(
                     "STATE_REPAIR_STOPPED：" + stopped +
                     "；已保留正文及状态反馈。需检查提取/审计规则，勿原样重跑或改正文碰通过。"
@@ -5977,6 +6178,7 @@ class NovelGeneratorGUI:
                 repair_block = ""
                 repair_base, repair_permissions = None, None
                 if last_issues:
+                    self._claim_chapter_repair()
                     try:
                         repair_base = state_ledger.parse_json_object(previous_raw)
                         repair_permissions = state_repair.plan(
@@ -6021,17 +6223,22 @@ class NovelGeneratorGUI:
                             + "。权限中的chapter如存在，由程序修正为当前章号，补丁不必输出chapter。"
                         )
                 try:
-                    raw = self._call_state_review(
+                    reuse_proposed = manual_proposed if manual_proposed is not None else resumed_proposed
+                    raw = json.dumps(reuse_proposed, ensure_ascii=False) if reuse_proposed is not None else self._call_state_review(
                         system_prompt,
                         base_prompt + repair_block,
                         chapter=chap_num, attempt=attempt,
                         phase="局部状态修复" if repair_permissions is not None else "状态提取",
                         temp=0.05,
+                        repair_history=repair_history if last_issues else None,
                     )
+                except state_ledger.StateExtractionError:
+                    raise
                 except Exception as exc:
                     raise state_ledger.StateExtractionError(
                         "状态提取调用未完成；保留正文并检查模型连接，不进入正文重写。"
                     ) from exc
+                output_cutoff = False
                 try:
                     proposed = state_ledger.parse_json_object(raw)
                     if repair_permissions is not None:
@@ -6070,18 +6277,29 @@ class NovelGeneratorGUI:
                     previous_raw = json.dumps(proposed, ensure_ascii=False)
                 except Exception as exc:
                     delta = {}
+                    output_cutoff = state_ledger.exhausted_json_output(
+                        exc, getattr(self, "_last_state_review_usage", {}))
                     if repair_permissions is not None:
                         # A malformed/out-of-scope patch cannot replace our repair
                         # base or erase the original rejected paths.
                         issues = list(last_issues) + ["局部状态补丁未应用：" + str(exc)]
                     else:
                         previous_raw, issues = raw, [str(exc)]
+                    if output_cutoff:
+                        issues.insert(0, "STATE_OUTPUT_TRUNCATED：JSON未完成且输出额度耗尽；保留原回复，禁止同额度原样重试或补括号伪造完整状态")
                 audit_enabled = bool(
-                    self.config.get("state_delta_independent_audit", True)
+                    manual_proposed is not None
+                    or resumed_proposed is not None
+                    or self.config.get("state_delta_independent_audit", True)
                     or self.config.get("pre_save_continuity_audit_enabled", True)
                     or any(item.get("progression") for item in delta.get("characters", []))
                 )
+                if issues and resumed_proposed is not None and manual_proposed is None:
+                    save_pending({**pending_audit_context, "status": "REJECTED"})
                 if not issues and audit_enabled:
+                    audit_candidate = state_repair.pending_audit_candidate(
+                        delta, chapter=chap_num, chapter_sha256=chapter_hash, state=state)
+                    save_pending(audit_candidate)
                     audit_system, audit_prompt = state_ledger.build_delta_audit_prompts(
                         delta,
                         state_context=prior_context,
@@ -6094,7 +6312,10 @@ class NovelGeneratorGUI:
                             audit_system,
                             audit_prompt,
                             chapter=chap_num, attempt=attempt, phase="独立证据审计", temp=0.0,
+                            repair_history=repair_history,
                         )
+                    except state_ledger.StateExtractionError:
+                        raise
                     except Exception as exc:
                         # An unavailable reviewer made no content judgment.
                         # Stop without spending another extraction attempt or
@@ -6142,6 +6363,7 @@ class NovelGeneratorGUI:
                     except Exception as exc:
                         issues = [f"独立证据审计失败：{str(exc)[:180]}"]
                         continuity_reject = False
+                    save_pending({**audit_candidate, "status": "REJECTED" if issues else "RESOLVED"})
                 if not issues:
                     self._append_batch_audit({
                         "event": "structured_state_prepared",
@@ -6176,6 +6398,7 @@ class NovelGeneratorGUI:
                             "repair_history": repair_history,
                             "repair_stop_reason": stopped,
                             "repair_scope": "prose" if continuity_reject else "state_only",
+                            "output_limit_exhausted": output_cutoff,
                         })
                     except Exception as exc:
                         self._state_repair_persistence_fault = (
@@ -6196,7 +6419,7 @@ class NovelGeneratorGUI:
                     "attempt": attempt,
                     "issues": issues[:20],
                 })
-                if continuity_reject or stopped:
+                if continuity_reject or stopped or output_cutoff:
                     # Only a reject explicitly aimed at the draft proves the prose
                     # contradicts canon.  A rejected structured path (even when the
                     # auditor cites prior state) is still an extraction error and
@@ -7574,7 +7797,11 @@ class NovelGeneratorGUI:
             self.current_vol, self.next_chap, self.filepath, self.latest_chap, self.latest_filepath = generator.get_latest_chapter_info()
             chap_num = self.next_chap
             self._refresh_live_progress_label()
-            self._begin_chapter_model_budget(chap_num)
+            try:
+                self._begin_chapter_model_budget(chap_num)
+            except chapter_budget.BudgetStopped as exc:
+                batch_end_message = f"[PAUSE] {exc}"
+                break
             # Bug3: 锁定本轮存盘路径
             chapter_filepath = self.filepath
 
@@ -7741,11 +7968,11 @@ class NovelGeneratorGUI:
             # stage-contract sources. Keep only recent chapter facts here to
             # avoid paying for the same context twice on every chapter.
             fact_context = knowledge_manager.build_generation_context(
-                generator.DIRS["plot"], chap_num, max_chars=1600, include_sources=False
+                generator.DIRS["plot"], chap_num, max_chars=None, include_sources=False
             )
             canon_context = ""
             if self.config.get("canon_guard_enabled", True):
-                canon_context = continuity_guard.build_canon_context(generator.DIRS["plot"], max_chars=2200)
+                canon_context = continuity_guard.build_canon_context(generator.DIRS["plot"], max_chars=None)
             fact_block = ""
             if fact_context:
                 fact_block = (
@@ -7804,8 +8031,8 @@ class NovelGeneratorGUI:
 {prev_content if prev_content else "（这是第一章，无上文）"}
 {fact_block}{canon_block}{story_block}"""
 
-            # 托管策略：初稿 + 多轮带诊断自修复；仍失败时按 L2/L3 策略决定继续或暂停。
-            max_retries = max(1, int(self.config.get("auto_repair_max_attempts", repair_engine.DEFAULT_MAX_REPAIR_ATTEMPTS) or repair_engine.DEFAULT_MAX_REPAIR_ATTEMPTS))
+            # 初稿 + 最多一轮诊断修复；恢复任务不能重新领取修复额度。
+            max_retries = chapter_budget.bounded_attempts(self.config.get("auto_repair_max_attempts", 2))
             retry_count = 0
             api_retry_count = 0
             chapter_content = ""
@@ -7849,6 +8076,7 @@ class NovelGeneratorGUI:
                         strict_reveal=strict_reveal,
                     )
                 ):
+                    self._claim_chapter_repair()
                     repair_notes.append(repair_engine.format_repair_note(reason, retry_count + 1))
                     retry_count += 1
                     self._write_batch_state(
@@ -7957,20 +8185,6 @@ class NovelGeneratorGUI:
                         attempt=retry_count + 1,
                         message=f"生成第{chap_num}章第{retry_count + 1}版",
                     )
-                    sys_prompt_run, plan_prompt_run, prompt_stats = self._apply_generation_prompt_budget(
-                        sys_prompt, attempt_prompt
-                    )
-                    if retry_count == 0:
-                        self._ui_progress_append(
-                            f"   输入估算：{prompt_stats['final']['input_tokens']} tokens"
-                            f"（system {prompt_stats['final']['system_chars']} chars / "
-                            f"user {prompt_stats['final']['user_chars']} chars）\n"
-                        )
-                    elif prompt_stats["trimmed"]:
-                        self._ui_progress_append(
-                            f"   重试前裁剪上下文：{prompt_stats['original']['input_tokens']} -> "
-                            f"{prompt_stats['final']['input_tokens']} tokens\n"
-                        )
                     state_only_candidate = (
                         self._load_state_only_candidate(chap_num, _review_draft_path(chapter_filepath))
                         if retry_count == 0 else None
@@ -7979,6 +8193,14 @@ class NovelGeneratorGUI:
                         chapter_content = state_only_candidate
                         self._ui_progress_append("   复用状态审计失败时保留的原正文，重新核验，不重新生成。\n")
                     else:
+                        sys_prompt_run, plan_prompt_run, prompt_stats = self._apply_generation_prompt_budget(
+                            sys_prompt, attempt_prompt
+                        )
+                        self._ui_progress_append(
+                            f"   输入估算：{prompt_stats['final']['input_tokens']} tokens"
+                            f"（system {prompt_stats['final']['system_chars']} chars / "
+                            f"user {prompt_stats['final']['user_chars']} chars）\n"
+                        )
                         self._before_model_call()
                         model_name = self.get_model_name()
                         chapter_content = self._call_generation_text(
@@ -8047,128 +8269,27 @@ class NovelGeneratorGUI:
                             })
                             self._ui_progress_append("   已移除规划终章前的误完结标记\n")
 
-                    # 重复结构硬拦截：第二个章节标题/大段重复必须返修或转待审，
-                    # 不能静默截断后写入正式稿，避免两版稿拼接污染后续上下文。
-                    repeat_issues = self._detect_chapter_repetition(chapter_content, chap_num)
-                    if repeat_issues:
-                        reason = "重复结构检测未通过：" + "；".join(repeat_issues[:3])
-                        self._ui_progress_append(f"  [RETRY] {reason}\n")
-                        _hard_retry_or_pause(reason, chapter_content)
-                        continue
-
-                    # 托管模式不做“续写式扩写”。短章直接进入诊断重写，避免拼接稿结构松散。
-                    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', chapter_content))
-
-                    # 超长稿常见于两版拼接。机械截断会丢失证据闭环和章末钩子，
-                    # 因此必须整章重写并在耗尽重试后保持待审。
-                    long_limit = int(char_limits["target_max"])
-                    if chinese_chars > long_limit:
-                        reason = (
-                            f"字数过长（{chinese_chars}字），超过目标上限{long_limit}字，"
-                            "疑似重复或多版拼接"
-                        )
-                        self._ui_progress_append(f"  [RETRY] {reason}\n")
-                        _hard_retry_or_pause(reason, chapter_content)
-                        continue
-
-                    # 字数硬下限：不足则进入自修复或 L2/L3 策略处理。
-                    if chinese_chars < char_limits["min"]:
-                        reason = f"字数不足（{chinese_chars}字），低于{char_limits['min']}字硬下限"
-                        self._ui_progress_append(f"  [WARN] {reason}\n")
-                        if repair_engine.should_rewrite(reason, chapter_content, char_limits=char_limits):
-                            _retry_or_block(reason, chapter_content)
-                            continue
-                        chapter_status = "可继续但需复核"
-                        chapter_review_notes.append(reason)
-                        self._append_batch_audit({
-                            "event": "short_chapter_review_continue",
-                            "chapter": chap_num,
-                            "chars": chinese_chars,
-                            "reason": reason,
-                        })
-
-                    # 高频模糊类比是可精确计数的机械指标，应在交给 LLM
-                    # 质检前先拦截，避免审稿器漏报，或把清晰的计数问题埋在
-                    # 一长串细纲意见之后导致下一版只修了第一项。
-                    simile_words = ("像是", "仿佛", "似乎")
-                    simile_count = sum(chapter_content.count(word) for word in simile_words)
-                    if simile_count > 4:
-                        reason = (
-                            f"反AI腔机械检查未通过：程序实测‘像是/仿佛/似乎’合计{simile_count}次，"
-                            "允许上限为4次。必须将超出的表达改成直接动作、事实或具体感官描写，"
-                            "并在输出前逐字复数。"
-                        )
-                        self._ui_progress_append(f"  [RETRY] {reason}\n")
-                        _hard_retry_or_pause(reason, chapter_content)
-                        continue
-
-                    # 内容漂移防火墙：命中禁词/格式残留后进入自修复或 L2/L3 策略处理。
-                    drift_hits = self._check_content_drift(chapter_content, chap_num=chap_num)
-                    if drift_hits:
-                        reason = f"漂移防火墙命中禁词/格式残留：{drift_hits}"
-                        self._ui_progress_append(f"   {reason}\n")
-                        _hard_retry_or_pause(reason, chapter_content)
-                        continue
-
-                    # 标题去重：重复则进入自修复或 L2/L3 策略处理。
-                    first_line = chapter_content.strip().split("\n")[0].lstrip("#").strip()
-                    new_title = re.sub(r'^第\d+章\s*', '', first_line)
-                    if new_title and new_title in all_titles_set:
-                        reason = f"标题重复：{new_title}"
-                        self._ui_progress_append(f"  {reason}\n")
-                        _hard_retry_or_pause(reason, chapter_content)
-                        continue
-
-                    candidate_report = chapter_validator.validate_candidate(
-                        self.project_dir or os.path.dirname(generator.DIRS["plot"]),
-                        chap_num,
-                        chapter_content,
-                        char_limits,
+                    # 一次收齐本地硬问题，再决定唯一一轮修复；不遇一项就重写。
+                    chinese_chars = repair_engine.chinese_char_count(chapter_content)
+                    local_review = self._collect_local_review(
+                        chapter_content, chap_num, char_limits, all_titles_set
                     )
-                    if not candidate_report.get("passed"):
-                        validator_messages = "；".join(
-                            str(item.get("message") or item.get("code") or "")
-                            for item in (candidate_report.get("issues") or [])[:8]
-                        )
-                        reason = "最终正文确定性验收未通过：" + validator_messages
-                        self._ui_progress_append(f"  [FAIL] {reason[:320]}\n")
-                        _hard_retry_or_pause(reason, chapter_content)
-                        continue
-                    chapter_validation_receipt = (
-                        chapter_validator.build_validation_receipt(candidate_report)
-                    )
-
-                    # 项目真相的本地语义硬门每章都扫描全量正式稿和当前候选。
-                    # 它不依赖模型给分，可直接识别身份、死因、数值与元话语冲突。
-                    semantic_report = self._run_semantic_consistency_guard(
-                        chapter_content, chap_num
-                    )
-                    if not semantic_report.get("passed"):
-                        reason = (
-                            "语义一致性硬门未通过："
-                            + self._semantic_guard_message(semantic_report)
-                        )
-                        self._ui_progress_append(f"  [FAIL] {reason[:320]}\n")
-                        _hard_retry_or_pause(reason, chapter_content)
-                        continue
-
-                    # 正史连续性硬检查：不能以“需复核”降级进入后续上下文。
-                    if self.config.get("canon_guard_enabled", True):
-                        canon_check = continuity_guard.validate_chapter(
-                            chapter_content,
-                            chap_num,
-                            generator.DIRS["plot"],
-                        )
-                        if canon_check["status"] == "FAIL":
-                            reason = f"正史连续性未通过：{canon_check['summary']}"
-                            self._ui_progress_append(f"  [FAIL] {reason}\n")
+                    self._append_batch_audit({
+                        "event": "local_review_packet", "chapter": chap_num,
+                        "chapter_sha256": state_ledger.chapter_sha256(chapter_content),
+                        "issues": local_review["issues"], "warnings": local_review["warnings"],
+                    })
+                    chapter_review_notes.extend(local_review["warnings"])
+                    if local_review["issues"]:
+                        reason = "本地硬检查未通过：" + "；".join(local_review["issues"])
+                        if local_review["blocked"]:
+                            _pause_without_retry(reason, chapter_content)
+                        else:
                             _hard_retry_or_pause(reason, chapter_content)
-                            continue
-
-                    # 标题章节号校验
-                    title_chap_match = re.match(r'第(\d+)章', first_line)
-                    if title_chap_match and int(title_chap_match.group(1)) != chap_num:
-                        chapter_content = re.sub(r'^第\d+章', f'第{chap_num}章', chapter_content, count=1)
+                        continue
+                    chapter_validation_receipt = chapter_validator.build_validation_receipt(
+                        local_review["candidate_report"]
+                    )
 
                     # 旧版逐章模型质检只在严格模式运行。简单模式前面已经完成
                     # 字数、结构、重复、语义与正史等确定性硬检查，不再重复耗费模型。
@@ -8179,6 +8300,9 @@ class NovelGeneratorGUI:
                                 chapter_content, chapter_outline, prev_content
                             )
                             gate_status = repair_engine.parse_gate_status(gate_result)
+                            if not re.search(r"(?mi)^\s*(PASS|WARN|FAIL)\b", gate_result or ""):
+                                _pause_without_retry("质检未返回明确裁决", chapter_content)
+                                continue
                             if gate_status == "FAIL":
                                 reason = f"质检未通过：{gate_result[:1800]}"
                                 self._ui_progress_append(
@@ -8187,12 +8311,11 @@ class NovelGeneratorGUI:
                                 _hard_retry_or_pause(reason, chapter_content)
                                 continue
                             if gate_status == "WARN":
-                                chapter_status = "可继续但需复核"
                                 chapter_review_notes.append(
                                     f"质检预警：{gate_result[:500]}"
                                 )
                                 self._ui_progress_append(
-                                    " WARN（已标记需复核，不自动发布）\n"
+                                    " WARN（记录建议，不追加改稿；其余硬门继续执行）\n"
                                 )
                             else:
                                 self._ui_progress_append(" PASS\n")
@@ -8206,7 +8329,7 @@ class NovelGeneratorGUI:
                             self._ui_progress_append(
                                 f" FAIL（质检不可用，禁止形成正式章节）：{str(e)[:100]}\n"
                             )
-                            _hard_retry_or_pause(reason, chapter_content)
+                            _pause_without_retry(reason, chapter_content)
                             continue
 
                     # ---- 发布前设定总校（FAIL 进入自修复或 L2/L3 策略处理）----
@@ -8494,11 +8617,22 @@ class NovelGeneratorGUI:
                             if should_pause_for_review:
                                 continue
 
+                    self._chapter_request_timeout(120)
                     success = True
 
                 except Exception as e:
                     err_msg = str(e)
                     err_lower = err_msg.lower()
+                    if isinstance(e, (prompt_budget.PromptBudgetError, chapter_budget.BudgetStopped)):
+                        if chapter_content:
+                            _pause_without_retry(err_msg, chapter_content)
+                        fatal_api_stop_msg = (
+                            "CHAPTER_BUDGET_STOPPED：" + err_msg
+                            if isinstance(e, chapter_budget.BudgetStopped) else err_msg
+                        )
+                        self._ui_progress_append(f"\n  [PAUSE] {err_msg}\n")
+                        retry_count = max_retries
+                        break
                     if "已达到止损" in err_msg or "费用止损" in err_msg:
                         fatal_api_stop_msg = err_msg
                         self._ui_progress_append(
@@ -8596,26 +8730,8 @@ class NovelGeneratorGUI:
                         except Exception:
                             self._ui_progress_append("\n  [FAIL] 上下文超限。\n")
 
-                    self._ui_progress_append(f"\n  [FAIL] 生成失败: {err_msg[:80]}\n")
-                    if retry_count < max_retries - 1:
-                        repair_notes.append(f"第{retry_count + 1}版生成异常：{err_msg[:500]}")
-                        retry_count += 1
-                        self._write_batch_state(
-                            status="running",
-                            current_chapter=chap_num,
-                            stage="api_retry",
-                            attempt=retry_count + 1,
-                            message=err_msg[:300],
-                        )
-                        self._append_batch_audit({
-                            "event": "api_retry",
-                            "chapter": chap_num,
-                            "attempt": retry_count + 1,
-                            "error": err_msg[:800],
-                        })
-                        time.sleep(3)
-                    else:
-                        retry_count = max_retries
+                    self._ui_progress_append(f"\n  [PAUSE] 调用异常，不自动改稿: {err_msg[:80]}\n")
+                    _pause_without_retry("调用异常：" + err_msg, chapter_content)
 
             if not success:
                 if self._stop_event.is_set():
@@ -8624,7 +8740,17 @@ class NovelGeneratorGUI:
                     break
 
                 if fatal_api_stop_msg:
-                    if "网络连续中断" in fatal_api_stop_msg:
+                    if "CHAPTER_BUDGET_STOPPED" in fatal_api_stop_msg:
+                        saved = _save_review_draft(chapter_filepath, paused_failure_content or chapter_content) if (paused_failure_content or chapter_content) else ""
+                        self._append_batch_audit({
+                            "event": "chapter_budget_paused", "chapter": chap_num,
+                            "reason": fatal_api_stop_msg, "draft": saved,
+                        })
+                        batch_end_message = f"[PAUSE] {fatal_api_stop_msg}；候选：{saved or '无完整候选'}"
+                    elif "PROMPT_BUDGET_EXCEEDED" in fatal_api_stop_msg:
+                        self._ui_progress_append(f"\n\n[PAUSE] {fatal_api_stop_msg}\n")
+                        batch_end_message = "[PAUSE] 核心上下文超限；保留候选，检查预算后再继续。"
+                    elif "网络连续中断" in fatal_api_stop_msg:
                         self._ui_progress_append(f"\n\n[PAUSE] {fatal_api_stop_msg}\n")
                         batch_end_message = "[PAUSE] 批量生成因网络连续中断暂停，可自动恢复。"
                     elif "止损" in fatal_api_stop_msg:
@@ -9858,10 +9984,18 @@ class NovelGeneratorGUI:
             "narrative_guard.py",
             "state_ledger.py",
             "state_repair.py",
+            "chapter_budget.py",
+            "prompt_budget.py",
+            "source_context.py",
+            "deepseek_runtime.py",
+            "generator.py",
             "continuity_guard.py",
             "temporal_memory.py",
             "knowledge_manager.py",
+            "commercial_planner.py",
             "commercial_reviewer.py",
+            "publishing_rules.py",
+            "story_architect.py",
             "chapter_validator.py",
         )
         hashes = {}
@@ -9903,10 +10037,10 @@ class NovelGeneratorGUI:
             plot_dir, chapter, max_chars=4500
         )
         canon_context = continuity_guard.build_canon_context(
-            plot_dir, max_chars=4500
+            plot_dir, max_chars=None
         )
         recent_context = knowledge_manager.build_generation_context(
-            plot_dir, chapter, max_chars=2600, include_sources=False
+            plot_dir, chapter, max_chars=None, include_sources=False
         )
         state_context, _manifest = state_ledger.render_context(
             state,
@@ -10040,11 +10174,10 @@ class NovelGeneratorGUI:
 
     def _durable_state_repair_arguments(self, chapter, fingerprint, stage):
         binding = {"chapter": int(chapter), "context_fingerprint": fingerprint}
-        pending_key = (os.path.abspath(self.project_dir), int(chapter), fingerprint, stage)
+        candidate_stage = stage.removesuffix("_rejected") + "_pending_audit"
         pending_rows = getattr(self, "_state_repair_pending_rejections", None)
         if pending_rows is None:
             pending_rows = self._state_repair_pending_rejections = {}
-        marker_stage = stage + "_pending"
 
         def load(name):
             return formal_suffix_rewrite.load_preflight_stage(
@@ -10058,8 +10191,10 @@ class NovelGeneratorGUI:
             if load(name) != payload:
                 raise OSError("状态修复记录写入后读回不一致")
 
-        try:
-            hint = load(stage)
+        def recover(name):
+            pending_key = (os.path.abspath(self.project_dir), int(chapter), fingerprint, name)
+            marker_stage = name + "_pending"
+            hint = load(name)
             marker = load(marker_stage)
             if marker is not None and (
                 not isinstance(marker, dict) or marker.get("status") not in {"PENDING", "RESOLVED"}
@@ -10072,12 +10207,17 @@ class NovelGeneratorGUI:
                 if pending is not None:
                     # Retry the actual failed payload, not a tiny probe. Retain
                     # it in memory until both persistence and readback succeed.
-                    verified_store(stage, pending)
-                    hint = load(stage)
+                    verified_store(name, pending)
+                    hint = load(name)
                 if hint is None or state_repair.digest(hint) != expected:
                     raise OSError("真实失败记录尚未补存；重启后缺少原记录，需恢复记录，不能仅靠探针解锁")
                 verified_store(marker_stage, {"status": "RESOLVED", "payload_sha256": expected})
                 pending_rows.pop(pending_key, None)
+            return hint
+
+        try:
+            hint = recover(stage)
+            audit_candidate = recover(candidate_stage)
             if pending_rows:
                 raise OSError("另一个绑定仍有未补存的状态失败记录")
             # A fresh nonce distinguishes a successful write from an old file.
@@ -10090,19 +10230,30 @@ class NovelGeneratorGUI:
             raise state_ledger.StateExtractionError(self._state_repair_persistence_fault) from exc
         self._state_repair_persistence_fault = ""
 
-        def store_rejection(payload):
-            if not isinstance(payload, dict) or payload.get("status") != "REJECTED":
-                raise ValueError("状态修复缓存只接受REJECTED反馈")
+        def store_transaction(name, payload):
+            pending_key = (os.path.abspath(self.project_dir), int(chapter), fingerprint, name)
+            marker_stage = name + "_pending"
             pending_rows[pending_key] = copy.deepcopy(payload)
             marker = {"status": "PENDING", "payload_sha256": state_repair.digest(payload)}
             # A compact durable intent prevents a restart from erasing a failed
             # larger write. It is not evidence and can never approve a chapter.
             verified_store(marker_stage, marker)
-            verified_store(stage, payload)
+            verified_store(name, payload)
             verified_store(marker_stage, {**marker, "status": "RESOLVED"})
             pending_rows.pop(pending_key, None)
 
-        return {"repair_context": hint, "rejection_callback": store_rejection}
+        def store_rejection(payload):
+            if not isinstance(payload, dict) or payload.get("status") != "REJECTED":
+                raise ValueError("状态修复缓存只接受REJECTED反馈")
+            store_transaction(stage, payload)
+
+        def store_audit_candidate(payload):
+            if not isinstance(payload, dict) or payload.get("status") not in {"PENDING", "REJECTED", "RESOLVED"}:
+                raise ValueError("未审状态候选不能写入通过声明")
+            store_transaction(candidate_stage, payload)
+
+        return {"repair_context": hint, "rejection_callback": store_rejection,
+                "pending_audit_context": audit_candidate, "pending_audit_callback": store_audit_candidate}
 
     def _handle_state_preparation_failure(self, chapter, content, error, reason, pause, rewrite):
         if not isinstance(error, state_ledger.StateProseConflictError):
@@ -10377,6 +10528,7 @@ class NovelGeneratorGUI:
 
     def _commit_manual_chapter(self, chap_num, chapter_path, content, history_label):
         """Manual text must pass the same narrative and evidence gates as automation."""
+        self._begin_chapter_model_budget(chap_num)
         content = (content or "").strip()
         char_limits = self._get_chapter_char_limits()
         chinese_chars = repair_engine.chinese_char_count(content)
@@ -10509,7 +10661,6 @@ class NovelGeneratorGUI:
             )
         if release_guard.get("status") == "WARN":
             release_guard_warning = str(release_guard.get("summary") or "")
-        self._begin_chapter_model_budget(chap_num)
         if strict_release:
             self._verify_existing_guarded_audit_history()
         current_state = (
@@ -12718,7 +12869,7 @@ class NovelGeneratorGUI:
             used_chars += len(block)
         slices = list(reversed(selected))
 
-        canon_context = continuity_guard.build_canon_context(generator.DIRS["plot"], max_chars=2200)
+        canon_context = continuity_guard.build_canon_context(generator.DIRS["plot"], max_chars=None)
         story_context = story_architect.build_story_context(generator.DIRS["plot"], chap_num, max_chars=2200)
         system_prompt = (
             "你是长篇小说连续性总审。只检查可验证的跨章逻辑，不评价文采。"
@@ -12743,6 +12894,13 @@ FINAL: PASS/WARN/FAIL
 CURRENT: PASS/FAIL
 REASON: 一句话说明；如果只是历史问题，CURRENT必须为PASS。
 """
+        system_prompt, user_prompt, _ = self._assemble_prompt_budget(
+            [prompt_budget.Block("semantic_arc_rules", system_prompt, "system"),
+             prompt_budget.Block("semantic_arc_evidence", user_prompt)],
+            stage="semantic_arc_review", system_cap=self.STATE_SYSTEM_CHAR_CAP,
+            user_cap=self.STATE_USER_CHAR_CAP,
+            token_budget=self.STATE_INPUT_TOKEN_BUDGET,
+        )
         try:
             raw = self.call_llm_review(system_prompt, user_prompt, max_tokens=1200)
         except Exception as exc:

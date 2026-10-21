@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -327,6 +328,24 @@ def initial_state() -> dict[str, Any]:
     }
 
 
+def state_review_output_limit(phase, extraction_limit=8192):
+    """Full evidence ledgers need a different budget from short audit/patch JSON."""
+    if phase != "状态提取":
+        return 3600
+    if type(extraction_limit) is not int or not 3600 <= extraction_limit <= 16384:
+        raise StateExtractionError("完整状态输出预算须为3600至16384整数，不能静默截断")
+    return extraction_limit
+
+
+def exhausted_json_output(error, usage):
+    return (str(error).startswith("状态增量 JSON 解析失败")
+            and isinstance(usage, dict)
+            and type(usage.get("completion_tokens")) is int
+            and type(usage.get("output_limit")) is int
+            and usage["output_limit"] > 0
+            and usage["completion_tokens"] >= usage["output_limit"])
+
+
 def parse_json_object(raw: str) -> dict[str, Any]:
     text = str(raw or "").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
@@ -384,6 +403,10 @@ def build_extraction_prompts(
         "资源quantity只填本次事件之后正文明确的余额或持有总量，不能填本次增减量；"
         "quantity_change填写本次增减量。正文没有明确余额时quantity必须为null。"
         "明确的事后余额优先于从稀疏事件增减量推算的余额。"
+        "同一资源在章内又被选择、交出或消耗时，SET的quantity/status须体现章末最终状态，"
+        "不能把早先中间面板当章末余额；后续数值未显示就用null并记录最后动作，不补造数字。"
+        "关系status如含时间、地点或夜归等背景，连续引文也须覆盖这些背景；"
+        "否则扩大引文或收窄status，不要从引文之外补充修饰。"
         "正文明确发生的资源消耗、取得、锁定或解锁不得漏记；使用最小且有证据的字段，"
         "同一场次/批次的余额优先沿用已有资源item名称，避免新建别名却留下旧余额。"
         "影响后续连续性的纸张、笔记、表格或文件发生批注、改写、签署、转交或归还时，"
@@ -621,6 +644,9 @@ def build_delta_audit_prompts(
         "状态上下文中的‘事件冷却’仅是非阻断节奏提醒，不是正史事实或连续性禁令；"
         "不得因为相邻章节使用同类冲突、调查或揭示就拒绝正文。"
         "只报告会污染后续正史的明确问题，不把合理回顾、推测口吻或有正文过程的新变化误判为冲突。"
+        "本轮须一次完整列出所有明确的reject和missing，不能只报一项留到下一轮。"
+        "若附带历史拒绝反馈，核对当前候选是否实际修正；历史反馈不是正史或审批。"
+        "对于相同事实与证据，不得仅换措辞提出相反修改；确须推翻旧意见时必须指出旧意见违反哪条原文或规则。"
         "只输出 JSON，不要 Markdown。"
     )
     user_prompt = f"""审计下列状态变化。输出：
@@ -808,6 +834,103 @@ def _entity_is_grounded(entity: str, quote: str, chapter_text: str, state: dict[
     return entity in state.get("characters", {})
 
 
+def _resource_quote_numbers(quote: str) -> set[int | float]:
+    """Recognize explicit literals, not inferred balances or old resource state."""
+    values: set[int | float] = set()
+    for raw in re.findall(r"(?<![\d.])\d+(?:\.\d+)?(?![\d.])", quote):
+        values.add(float(raw) if "." in raw else int(raw))
+    digits = {char: n for n, char in enumerate("零一二三四五六七八九")}
+    digits.update({"〇": 0, "两": 2})
+    units = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+    for raw in re.findall(r"[零〇一二两三四五六七八九十百千万]+", quote):
+        if not any(char in units for char in raw):
+            values.add(int("".join(str(digits[char]) for char in raw)))
+            continue
+        total = section = number = 0
+        for char in raw:
+            if char in digits:
+                number = digits[char]
+            elif char == "万":
+                total += (section + number) * 10000
+                section = number = 0
+            else:
+                section += (number or 1) * units[char]
+                number = 0
+        values.add(total + section + number)
+    return values
+
+
+def _resource_sequence_issues(resources: list[dict[str, Any]], chapter_text: str) -> list[str]:
+    """Diagnose only local, evidenced numeric chains; never sort or fill a delta.
+
+    A SET/explicit GAIN starts a fresh anchor. Previous chapter quantities are
+    deliberately unavailable: a same-named resource may be another match/batch.
+    Sparse post-event balances remain authoritative when the quoted change is
+    not explicit. Ambiguous quotes and unknown quantities leave semantic review
+    in charge rather than inventing a deterministic chronology or exact value.
+    """
+    groups: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
+    for index, row in enumerate(resources):
+        if row["owner"] and row["item"] and row["action"] in {"GAIN", "USE", "LOSE", "SET"}:
+            groups.setdefault((row["owner"], row["item"]), []).append((index, row))
+    prose = _normalized_evidence(chapter_text)
+    issues = []
+    for rows in groups.values():
+        if len(rows) < 2:
+            continue
+        positioned = []
+        for index, row in rows:
+            needle = _normalized_evidence(row["evidence_quote"])
+            literals = _resource_quote_numbers(row["evidence_quote"])
+            values = [row[key] for key in ("quantity", "quantity_change") if row[key] is not None]
+            if (len(needle) < 4 or prose.count(needle) != 1 or not values
+                    or not any(abs(value) in literals for value in values)):
+                break
+            positioned.append((prose.find(needle), index, row, literals))
+        else:
+            ordered = sorted(positioned, key=lambda entry: entry[0])
+            reasons = []
+            # Equal offsets are legal: a single unique quote can establish
+            # several simultaneous rows. Different items are never compared.
+            if ([entry[0] for entry in positioned] != sorted(entry[0] for entry in positioned)
+                    and any(row["quantity"] is not None and row["quantity"] in literals
+                            for _offset, _index, row, literals in positioned)):
+                reasons.append("同一资源的明确数量变化数组顺序与唯一连续原文引文顺序不一致")
+            current = None
+            previous_offset = None
+            for offset, _index, row, literals in ordered:
+                action, quantity, change = row["action"], row["quantity"], row["quantity_change"]
+                explicit_change = change is not None and abs(change) in literals
+                expected = None
+                if current is not None and explicit_change and previous_offset != offset:
+                    expected = current + (abs(change) if action == "GAIN" else -abs(change))
+                    if action in {"USE", "LOSE"}:
+                        if expected < 0:
+                            reasons.append("本章明确取得/余额与原文明确消耗量会产生负余额")
+                        zero_end = quantity == 0 and action == "LOSE" and bool(re.search(
+                            r"关闭|消失|失效|归零|耗尽|清零", row["evidence_quote"]))
+                        if quantity is not None and (quantity in literals or zero_end) and quantity != expected:
+                            if not (isinstance(quantity, float) or isinstance(expected, float)) or not math.isclose(
+                                    quantity, expected, rel_tol=1e-9, abs_tol=1e-9):
+                                reasons.append("本章前置明确余额、本次明确quantity_change与quantity不一致")
+                if quantity is not None and quantity in literals:
+                    current = quantity
+                elif action == "SET" or (action == "GAIN" and quantity is not None):
+                    current = None  # An ungrounded/new-batch reset is not an old balance.
+                elif expected is not None and action in {"GAIN", "USE", "LOSE"}:
+                    current = expected
+                else:
+                    current = None
+                previous_offset = offset
+            if reasons:
+                detail = "；".join(dict.fromkeys(reasons))
+                # Every implicated existing row must be editable in the ONE
+                # current repair; no new permissions for unrelated resource groups.
+                issues.extend(f"resources[{index}] 资源数量链矛盾：{detail}；仅修状态提取，保留完整取得/使用/失效证据"
+                              for index, _row in rows)
+    return issues
+
+
 def validate_delta(
     payload: dict[str, Any],
     chapter_number: int,
@@ -915,11 +1038,13 @@ def validate_delta(
             issues.append(f"{path}.action 非法")
         quantity_change = item.get("quantity_change")
         quantity = item.get("quantity")
-        if quantity_change is not None and not isinstance(quantity_change, (int, float)):
-            issues.append(f"{path}.quantity_change 必须是数字或 null")
+        if quantity_change is not None and (type(quantity_change) not in (int, float)
+                or (isinstance(quantity_change, float) and not math.isfinite(quantity_change))):
+            issues.append(f"{path}.quantity_change 必须是有限数字或 null")
             quantity_change = None
-        if quantity is not None and not isinstance(quantity, (int, float)):
-            issues.append(f"{path}.quantity 必须是数字或 null")
+        if quantity is not None and (type(quantity) not in (int, float)
+                or (isinstance(quantity, float) and not math.isfinite(quantity))):
+            issues.append(f"{path}.quantity 必须是有限数字或 null")
             quantity = None
         if quantity is not None and quantity < 0:
             issues.append(f"{path}.quantity 不能为负数")
@@ -934,6 +1059,11 @@ def validate_delta(
                 "evidence_quote": quote,
             }
         )
+
+    raw_resources = payload.get("resources", [])
+    if (isinstance(raw_resources, list) and len(raw_resources) <= MAX_ITEMS["resources"]
+            and all(isinstance(row, dict) for row in raw_resources)):
+        issues.extend(_resource_sequence_issues(normalized["resources"], chapter_text))
 
     for idx, item in enumerate(_items(payload, "relationships", issues)):
         path = f"relationships[{idx}]"

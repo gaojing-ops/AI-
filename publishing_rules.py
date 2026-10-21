@@ -131,6 +131,7 @@ def project_rules_fingerprint(project_config=None, reveal_rules=None):
     reveal_rules = reveal_rules if isinstance(reveal_rules, dict) else {}
     payload = {
         "ruleset_version": FANQIE_RULESET_VERSION,
+        "theme_direction_mode": "whole_source_v1",
         "book_title": str(project_config.get("book_title") or "").strip(),
         "genre": str(project_config.get("genre_template") or "").strip(),
         "book_brief": str(project_config.get("book_brief") or "").strip(),
@@ -161,7 +162,7 @@ def build_project_tool_rules(project_config=None, reveal_rules=None, existing_ru
     rules["theme_contract"] = {
         "book_title": str(project_config.get("book_title") or "").strip(),
         "genre": str(project_config.get("genre_template") or "").strip(),
-        "core_direction": brief[:3000],
+        "core_direction": brief,
         "real_people_policy": str(project_config.get("real_people_policy") or "").strip(),
     }
     rules["theme_avoid_terms"] = avoid_terms

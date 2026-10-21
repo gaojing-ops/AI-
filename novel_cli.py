@@ -982,6 +982,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument("--project", required=True)
 
+    export = sub.add_parser("candidate-export", help="候选全书阅读稿；默认只读，零模型且不正式采用")
+    export.add_argument("--project", required=True)
+    export.add_argument("--index", required=True, help="明确选稿索引，不按目录时间猜版本")
+    export.add_argument("--output", required=True, help="仅可写project/rewrite_staging内TXT")
+    export.add_argument("--title", required=True)
+    export.add_argument("--end", type=int, default=180)
+    export.add_argument("--execute", action="store_true", help="只创建候选阅读稿及导出清单，不覆写不同文件")
+
+    revision = sub.add_parser("revision", help="正常修订持久断点；默认只读，不重做已提交章")
+    revision.add_argument("--project", required=True)
+    revision.add_argument("--candidates-dir")
+    revision.add_argument("--checkpoint", help="首次导入已验隔离项目目录")
+    revision.add_argument("--bundle-dir", help="已审修订配套文件目录")
+    revision.add_argument("--session")
+    revision.add_argument("--through", type=int)
+    revision.add_argument("--replace", action="append", default=[], metavar="N=PATH", help="显式替换未验章节候选；可重复")
+    revision.add_argument("--replace-bundle-dir", help="只替换本次未验合同对应配套，不改变已验合同")
+    revision.add_argument("--reason", help="重绑定具体修复理由，保留旧失败与预算")
+    revision.add_argument("--state-patch", help="明确人工状态局部JSON补丁，只做一次独立审计，不生成正文/状态或续预算")
+    revision.add_argument("--resume-state-audit", action="store_true", help="显式恢复同绑定未完成服务审计一次，需理由及人工处理旧预算；不恢复语义FAIL")
+    revision.add_argument("--isolated-provider", choices=["deepseek"], help="显式切换隔离副本，保留旧章模型绑定；不迁移正式配置/续预算/发模型")
+    revision.add_argument("--apply", action="store_true", help="完整隔离通过后正常事务采用，并单独审提下一章")
+    revision.add_argument("--execute", action="store_true")
+
     run = sub.add_parser("run", help="运行有明确终点的正式批次")
     run.add_argument("--project", required=True)
     run.add_argument("--to", required=True, type=int, help="本批最后一章")
@@ -1023,8 +1047,60 @@ def main(argv=None) -> int:
             report = build_doctor_report(args.project)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 2 if report["overall_status"] == "FAIL" else 0
+        if args.command == "candidate-export":
+            from candidate_export import prepare_export, write_export
+            plan = prepare_export(args.project, args.index, args.output, args.title, expected_end=args.end)
+            result = write_export(plan) if args.execute else {"read_only": True, "status": "CANDIDATE_EXPORT_PLAN", **plan.summary}
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         if args.command == "micro-edit":
             return run_micro_edit(args)
+        if args.command == "revision":
+            from revision_session import RevisionSession
+            session_path = Path(args.session) if args.session else Path(args.project) / "runtime" / "revision_sessions" / "current.json"
+            if not args.execute:
+                result = RevisionSession.open(args.project, session_path).summary() if session_path.exists() else {
+                    "status": "NOT_INITIALIZED", "session": str(session_path.resolve()),
+                    "checkpoint_project": args.checkpoint, "through": args.through}
+                print(json.dumps({"read_only": True, **result}, ensure_ascii=False, indent=2))
+                return 0
+            if not session_path.exists() and not args.candidates_dir:
+                raise RuntimeError("首次创建修订会话必须指定--candidates-dir")
+            if args.resume_state_audit and not args.state_patch:
+                raise RuntimeError("--resume-state-audit必须与--state-patch一起显式使用")
+            session = RevisionSession.open(args.project, session_path) if session_path.exists() else RevisionSession.create(
+                args.project, args.candidates_dir or "", args.checkpoint, session_path, args.bundle_dir)
+            if args.isolated_provider:
+                if args.apply or args.replace or args.replace_bundle_dir or args.state_patch or args.through is not None:
+                    raise RuntimeError("隔离模型切换须单独执行，不与接续/采用混用")
+                result = session.configure_isolated_provider(args.isolated_provider, reason=args.reason or "")
+            elif args.state_patch:
+                if args.apply or args.replace or args.replace_bundle_dir:
+                    raise RuntimeError("人工状态修复须与替换输入/正式采用分开执行")
+                result = session.repair_state(args.state_patch, resume_unavailable=True, reason=args.reason or "") if args.resume_state_audit else session.repair_state(args.state_patch)
+                if result["status"] == "STATE_PREPARED" and args.through is not None:
+                    result = session.advance(args.through)
+            elif args.replace or args.replace_bundle_dir:
+                if args.apply:
+                    raise RuntimeError("重绑定与正式采用须分开执行")
+                replacements = {}
+                for value in args.replace:
+                    number, separator, path = value.partition("=")
+                    if not separator or not number.isdecimal() or not path or int(number) in replacements:
+                        raise ValueError("--replace格式须为唯一章节N=PATH")
+                    replacements[int(number)] = path
+                result = session.rebind(replacements, reason=args.reason or "", bundle_dir=args.replace_bundle_dir)
+                if args.through is not None:
+                    result = session.advance(args.through)
+            else:
+                result = session.apply() if args.apply else session.advance(args.through or session.summary()["next_chapter"])
+            input_only_rebind = bool(args.replace or args.replace_bundle_dir) and args.through is None
+            if input_only_rebind:
+                result = {**result, "operation_status": "INPUTS_REBOUND", "model_calls": 0, "advanced": False}
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            # Binding succeeded even when the original model stop remains.
+            # Do not invite clients to replay a completed binding as a failure.
+            return 2 if result["status"] == "STOPPED" and not input_only_rebind and not args.isolated_provider else 0
         return run_bounded_batch(args)
     except Exception as exc:
         print(f"[BLOCKED] {exc}", file=sys.stderr)

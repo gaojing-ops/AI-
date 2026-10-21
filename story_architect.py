@@ -5,6 +5,13 @@ import json
 import os
 import re
 
+from source_context import require_complete_source
+
+
+def _complete_context(text, max_chars, source_label):
+    """A filtered stage contract is indivisible; never return a partial rule."""
+    return require_complete_source(text, max_chars, source_label)
+
 
 STORY_BIBLE_FILENAME = "story_bible.json"
 REQUIRED_OUTLINE_FIELDS = (
@@ -311,7 +318,7 @@ def build_stage_truth_context(plot_dir, chap_num, max_chars=2800):
     if blocked:
         lines.append("- 后期作者层术语已从本章上下文移除，不得自行补全其名称和因果。")
     lines.append("- 未列入角色当前认知的客观因果，不得由旁白、系统或高可信角色代为公布。")
-    return "\n".join(lines)[:max_chars]
+    return _complete_context("\n".join(lines), max_chars, "本章可见真相边界")
 
 
 def build_story_context(plot_dir, chap_num, max_chars=2600):
@@ -359,7 +366,7 @@ def build_story_context(plot_dir, chap_num, max_chars=2600):
                         separators=(",", ":"),
                     )
                 lines.append(f"  {field_label}：{value}")
-    return "\n".join(lines)[:max_chars]
+    return _complete_context("\n".join(lines), max_chars, "结构化故事契约")
 
 
 def _matches_contract_choice(value, choices):

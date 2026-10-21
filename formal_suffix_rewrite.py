@@ -275,6 +275,7 @@ def _preflight_cache_has_recovery_data(path: Path) -> bool:
                 return True
             if (isinstance(payload, dict)
                     and ((name.endswith("_rejected") and payload.get("status") == "REJECTED")
+                         or (name.endswith("_pending_audit") and payload.get("status") == "PENDING")
                          or (name.endswith("_pending") and payload.get("status") == "PENDING"))):
                 return True
     except Exception:
@@ -309,7 +310,8 @@ def store_preflight_stage(
     """Preserve typed preflight work outside rollback surfaces.
 
     The structured_state_rejected stage is repair input, not approval; callers
-    must run fresh extraction and independent audit before storing passed state.
+    must validate the exact current binding and run independent audit before
+    storing passed state. An unreviewed candidate is recovery data, not approval.
     """
 
     project = Path(project_dir).resolve()

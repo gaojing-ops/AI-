@@ -65,7 +65,7 @@ class DeepSeekRuntimeTests(unittest.TestCase):
         normalized = deepseek_runtime.normalize_usage(usage)
         self.assertEqual(20, normalized["reasoning_tokens"])
         self.assertEqual(350, normalized["total_tokens"])
-        expected = (200 * 0.02 + 100 * 1 + 50 * 2) / 1_000_000
+        expected = (200 * 0.04 + 100 * 2 + 50 * 8) / 1_000_000
         self.assertAlmostEqual(
             expected,
             deepseek_runtime.estimate_cost_cny("deepseek-v4-flash", normalized),

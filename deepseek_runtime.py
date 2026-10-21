@@ -13,14 +13,22 @@ from urllib.parse import quote, urlparse
 from typing import Any, Callable
 
 
-SUPPORTED_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
+MODEL_ALIASES = {"deepseek-v4-flash": "deepseek-flash",
+                 "deepseek-v4-flash-vision-exp": "deepseek-flash"}
+SUPPORTED_MODELS = {"deepseek-flash", "deepseek-v4-pro", *MODEL_ALIASES}
+PRICING_VERSION = "2026-09-29-official-peak-ceiling"
+PRICING_SOURCE = "https://api-docs.deepseek.com/zh-cn/quick_start/pricing"
 
-# CNY per one million tokens.  These are only used for a clearly labelled
-# estimate; the durable token counters remain authoritative if prices change.
+# CNY per million tokens, PEAK rates. Conservative insurance avoids guessing
+# Chinese statutory holidays or cross-period requests. Off-peak is exactly half.
 DEFAULT_PRICING_CNY = {
-    "deepseek-v4-flash": {"cache_hit": 0.02, "cache_miss": 1.0, "output": 2.0},
-    "deepseek-v4-pro": {"cache_hit": 0.025, "cache_miss": 3.0, "output": 6.0},
+    "deepseek-flash": {"cache_hit": 0.04, "cache_miss": 2.0, "output": 8.0},
+    "deepseek-v4-pro": {"cache_hit": 0.30, "cache_miss": 9.0, "output": 27.0},
 }
+
+
+def canonical_model(model: str) -> str:
+    return MODEL_ALIASES.get(model, model)
 
 
 class DeepSeekPreflightError(RuntimeError):
@@ -198,15 +206,17 @@ def normalize_usage(usage: Any) -> dict[str, int]:
     }
 
 
-def estimate_cost_cny(model: str, usage: dict[str, int]) -> float:
-    rates = DEFAULT_PRICING_CNY.get(model)
+def estimate_cost_cny(model: str, usage: dict[str, int], *, period="peak") -> float:
+    if period not in {"peak", "off_peak"}:
+        raise ValueError("未知计价时段")
+    rates = DEFAULT_PRICING_CNY.get(canonical_model(model))
     if not rates:
         return 0.0
     return (
         usage.get("prompt_cache_hit_tokens", 0) * rates["cache_hit"]
         + usage.get("prompt_cache_miss_tokens", 0) * rates["cache_miss"]
         + usage.get("completion_tokens", 0) * rates["output"]
-    ) / 1_000_000
+    ) / 1_000_000 * (0.5 if period == "off_peak" else 1.0)
 
 
 def _available_model_ids(response: Any) -> set[str]:
@@ -249,9 +259,12 @@ def preflight(
     if model_error is not None:
         raise DeepSeekPreflightError(f"模型列表读取失败：{model_error}") from model_error
     available = _available_model_ids(model_response)
-    missing = sorted({str(item) for item in required_models if item} - available)
+    canonical_available = {canonical_model(item) for item in available}
+    missing = sorted({str(item) for item in required_models if item
+                      and canonical_model(str(item)) not in canonical_available})
     if missing:
-        raise DeepSeekPreflightError("当前账号不可用模型：" + "、".join(missing))
+        raise DeepSeekPreflightError("当前账号不可用模型：" + "、".join(missing)
+                                    + "；接口模型：" + "、".join(sorted(available)))
 
     endpoint = str(base_url or "https://api.deepseek.com").rstrip("/")
     if endpoint.endswith("/v1"):
@@ -280,5 +293,7 @@ def preflight(
         "status": "PASS",
         "available_models": sorted(available),
         "required_models": sorted(set(required_models)),
+        "model_aliases": {item: canonical_model(item) for item in required_models
+                          if item in MODEL_ALIASES},
         "balance_infos": balance.get("balance_infos") or [],
     }
