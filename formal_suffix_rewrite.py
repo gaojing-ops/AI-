@@ -587,7 +587,8 @@ def create_isolated_preflight_project(
         current = Path(directory).resolve()
         ignored: set[str] = set()
         if current == project:
-            ignored.update({".runtime", project_job_lock.LOCK_FILENAME})
+            ignored.update({".runtime", project_job_lock.LOCK_FILENAME,
+                            project_job_lock.GUARD_FILENAME})
         return ignored.intersection(names)
 
     shutil.copytree(

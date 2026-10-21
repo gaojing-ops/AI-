@@ -5003,7 +5003,8 @@ class NovelGeneratorGUI:
         }
 
     def _record_model_usage(
-        self, usage, model, thinking, task_type, *, provider=None, evidence=None
+        self, usage, model, thinking, task_type, *, provider=None, evidence=None,
+        usage_kind="provider", usage_note="",
     ):
         provider = normalize_model_provider(
             provider or self.get_model_provider(),
@@ -5041,6 +5042,8 @@ class NovelGeneratorGUI:
                 "provider": provider,
                 "model": model,
                 "thinking": bool(thinking),
+                "usage_kind": usage_kind,
+                "usage_note": usage_note,
                 **normalized,
                 "estimated_cost_cny": round(estimated_cost, 8),
                 "pricing_note": pricing_note,
@@ -5385,26 +5388,27 @@ class NovelGeneratorGUI:
         client = self.get_client()
         if client is None:
             raise RuntimeError("未配置 DeepSeek API Key")
-        stream = client.chat.completions.create(**self._deepseek_request_kwargs(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=token_limit,
-            temperature=self.config.get("temperature", 0.8),
-            review=False,
-            stream=True,
-        ))
+        stream = None
         content = ""
         stream_usage = None
         try:
+            stream = client.chat.completions.create(**self._deepseek_request_kwargs(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=token_limit,
+                temperature=self.config.get("temperature", 0.8),
+                review=False,
+                stream=True,
+            ))
             for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    stream_usage = chunk.usage
                 budget = getattr(self, "_durable_chapter_budget", None)
                 if budget is not None:
                     budget.check_stream()
-                if getattr(chunk, "usage", None):
-                    stream_usage = chunk.usage
                 if self._stop_event.is_set():
                     break
                 if chunk.choices and chunk.choices[0].delta.content:
@@ -5413,16 +5417,32 @@ class NovelGeneratorGUI:
                     if on_chunk is not None:
                         on_chunk(text_chunk)
         finally:
-            close_stream = getattr(stream, "close", None)
-            if callable(close_stream):
-                close_stream()
-        self._record_model_usage(
-            stream_usage,
-            model_name,
-            bool(self.config.get("deepseek_generation_thinking", False)),
-            task_type,
-            provider=PROVIDER_DEEPSEEK,
-        )
+            try:
+                close_stream = getattr(stream, "close", None)
+                if callable(close_stream):
+                    close_stream()
+            finally:
+                usage_options = {}
+                if not deepseek_runtime.normalize_usage(stream_usage).get("total_tokens"):
+                    # A lost final usage chunk is not a free request. Persist
+                    # the same conservative reservation used at admission, so
+                    # restart cannot turn unknown incurred cost into zero.
+                    prompt_tokens = self._estimate_token_count(system_prompt) + self._estimate_token_count(user_prompt)
+                    stream_usage = {
+                        "prompt_tokens": prompt_tokens,
+                        "prompt_cache_miss_tokens": prompt_tokens,
+                        "completion_tokens": int(token_limit),
+                        "total_tokens": prompt_tokens + int(token_limit),
+                    }
+                    usage_options = {
+                        "usage_kind": "estimated_reservation",
+                        "usage_note": "流式用量未完整返回，按调用预留保守记账，非服务商实测用量",
+                    }
+                self._record_model_usage(
+                    stream_usage, model_name,
+                    bool(self.config.get("deepseek_generation_thinking", False)),
+                    task_type, provider=PROVIDER_DEEPSEEK, **usage_options,
+                )
         return content
 
     def stream_call_llm(self, system_prompt, final_user_prompt, is_new=True):
@@ -5602,7 +5622,10 @@ class NovelGeneratorGUI:
             if commercial_fallback:
                 self._commercial_review_fallback_call_active = True
             try:
-                self._before_model_call()
+                fallback_reserve = self._estimate_model_call_reserve_cny(
+                    selected_model, system_prompt, user_prompt, token_limit
+                )
+                self._before_model_call(reserved_cost_cny=fallback_reserve)
             finally:
                 if commercial_fallback:
                     self._commercial_review_fallback_call_active = False
@@ -8201,13 +8224,17 @@ class NovelGeneratorGUI:
                             f"（system {prompt_stats['final']['system_chars']} chars / "
                             f"user {prompt_stats['final']['user_chars']} chars）\n"
                         )
-                        self._before_model_call()
                         model_name = self.get_model_name()
+                        token_limit = int(self.config.get("max_tokens", 8192) or 8192)
+                        reserve = self._estimate_model_call_reserve_cny(
+                            model_name, sys_prompt_run, plan_prompt_run, token_limit
+                        )
+                        self._before_model_call(reserved_cost_cny=reserve)
                         chapter_content = self._call_generation_text(
                             sys_prompt_run,
                             plan_prompt_run,
                             model_name=model_name,
-                            token_limit=int(self.config.get("max_tokens", 8192) or 8192),
+                            token_limit=token_limit,
                             task_type="batch_chapter_generation",
                             on_chunk=self._ui_append,
                         )

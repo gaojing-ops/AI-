@@ -7,6 +7,7 @@ from pathlib import Path
 
 import formal_suffix_rewrite
 import gui_app
+import project_job_lock
 
 
 class FormalSuffixRewriteTests(unittest.TestCase):
@@ -593,13 +594,20 @@ class FormalSuffixRewriteTests(unittest.TestCase):
         archive_sentinel.write_text("large archive", encoding="utf-8")
         destination = Path(temp.name) / "isolated"
 
-        isolated, isolated_candidates = (
-            formal_suffix_rewrite.create_isolated_preflight_project(
-                project,
-                destination,
-                candidates,
+        lock = project_job_lock.ProjectJobLock(project)
+        self.assertTrue(lock.acquire("隔离预审")[0])
+        try:
+            isolated, isolated_candidates = (
+                formal_suffix_rewrite.create_isolated_preflight_project(
+                    project,
+                    destination,
+                    candidates,
+                )
             )
-        )
+        finally:
+            lock.release()
+        self.assertFalse((isolated / project_job_lock.GUARD_FILENAME).exists())
+        self.assertFalse((isolated / project_job_lock.LOCK_FILENAME).exists())
 
         self.assertFalse(
             (isolated / ".runtime" / formal_suffix_rewrite.ARCHIVE_DIRNAME).exists()

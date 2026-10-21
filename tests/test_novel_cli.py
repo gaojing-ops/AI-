@@ -27,7 +27,7 @@ class NovelCliTests(unittest.TestCase):
                 row = next(x for x in report["derived_state"]["items"]
                            if x["name"] == "关键事实库")
                 self.assertEqual(expected, row["status"])
-                self.assertEqual(expected, report["overall_status"])
+                self.assertEqual("FAIL" if expected == "FAIL" else "WARN", report["overall_status"])
                 self.assertEqual(before, self._tree_hashes(project))
 
     def test_rolling_hold_requires_completed_hash_bound_historical_evidence(self):
@@ -115,6 +115,7 @@ class NovelCliTests(unittest.TestCase):
         status_rows = []
         for number in chapters:
             output = project / "output" / "第01卷" / f"第{number:04d}章.txt"
+            output.write_text(f"第{number}章 测试\n\n" + "正文" * 1600, encoding="utf-8")
             publish = project / "publish" / "第01卷" / output.name
             publish.write_bytes(output.read_bytes())
             status_rows.append({
@@ -372,8 +373,34 @@ class NovelCliTests(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             self.assertEqual(0, code)
             self.assertTrue(payload["read_only"])
-            self.assertEqual("PASS", payload["overall_status"])
-            self.assertEqual("PASS", payload["derived_state"]["overall_status"])
+            self.assertEqual("WARN", payload["overall_status"])
+            self.assertEqual("WARN", payload["derived_state"]["overall_status"])
+            self.assertEqual(before, self._tree_hashes(project))
+
+    def test_default_doctor_rejects_short_chapter_without_running_models(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = self._doctor_ready_project(Path(temp_dir), chapters=(1,))
+            config = {"release_mode": "simple", "doctor_evidence_enforcement": False,
+                      "chapter_char_min": 3200}
+            (project / "project_config.json").write_text(json.dumps(config), encoding="utf-8")
+            output = project / "output" / "第01卷" / "第0001章.txt"
+            output.write_text("第1章 测试\n\n正文", encoding="utf-8")
+            before = self._tree_hashes(project)
+            report = novel_cli.build_doctor_report(project)
+            rows = report["derived_state"]["items"]
+            self.assertEqual("FAIL", report["overall_status"])
+            self.assertEqual("FAIL", next(x for x in rows if x["name"] == "基础正文字数")["status"])
+            self.assertEqual(before, self._tree_hashes(project))
+
+    def test_disabled_deep_evidence_check_is_visible_warn_not_pass(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = self._doctor_ready_project(Path(temp_dir))
+            before = self._tree_hashes(project)
+            report = novel_cli.build_doctor_report(project)
+            row = next(x for x in report["derived_state"]["items"] if x["name"] == "正式证据链")
+            self.assertEqual("WARN", row["status"])
+            self.assertIn("提交收据", row["checks_skipped"])
+            self.assertEqual("WARN", report["overall_status"])
             self.assertEqual(before, self._tree_hashes(project))
 
     def test_doctor_fails_when_a_derived_state_leads_formal_text(self):

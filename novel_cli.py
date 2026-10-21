@@ -444,7 +444,29 @@ def _formal_evidence_integrity_items(
 ) -> list[dict[str, Any]]:
     """Verify hash-bound state and strict commit evidence after an explicit boundary."""
     if not bool(config.get("doctor_evidence_enforcement", False)):
-        return []
+        if not formal_paths:
+            return [_item("正式证据链", "PASS", "暂无正式章节，无需检查提交证据")]
+        minimum = config.get("chapter_char_min", 3000)
+        issues = []
+        if type(minimum) is not int or minimum < 1:
+            issues.append("chapter_char_min 必须为正整数")
+        else:
+            for chapter, path in sorted(formal_paths.items()):
+                try:
+                    text = path.read_text(encoding="utf-8-sig")
+                    count = len(re.findall(r"[\u4e00-\u9fff]", text))
+                    if count < minimum:
+                        issues.append(f"第{chapter}章净汉字{count}，少于下限{minimum}")
+                except (OSError, UnicodeError) as exc:
+                    issues.append(f"第{chapter}章无法读取：{exc}")
+        return [
+            _item("基础正文字数", "FAIL" if issues else "PASS",
+                  "；".join(issues[:16]) if issues else f"{len(formal_paths)}章达到净汉字下限{minimum}",
+                  issue_count=len(issues)),
+            _item("正式证据链", "WARN",
+                  "未启用完整提交证据链校验；当前结果不能作为完整正式验收通过",
+                  checks_skipped=["提交收据", "状态增量重放", "模型审计证据"]),
+        ]
     boundary = max(0, int(_safe_int(config.get("legacy_evidence_exempt_through_chapter")) or 0))
     enforced = [chapter for chapter in sorted(formal_paths) if chapter > boundary]
     if not enforced:
